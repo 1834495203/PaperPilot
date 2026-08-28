@@ -1,0 +1,9 @@
+aiosqlite>=0.21,<1
+fastapi>=0.116,<1
+httpx>=0.28,<1
+langchain>=1,<2
+langchain-openai>=1,<2
+langgraph>=1,<2
+pydantic-settings>=2.10,<3
+sqlalchemy[asyncio]>=2.0,<3
+uvicorn[standard]>=0.35,<1
