@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.application.chat_service import ChatService
 from app.config import Settings
-from app.infrastructure.agent.graph import PaperAgentGraph
+from app.infrastructure.agent.supervisor.factory import create_supervisor_agent
 from app.infrastructure.db.store import SqlAlchemyConversationStore
 from app.infrastructure.tools.arxiv import ArxivPaperSearchGateway
 
@@ -27,11 +27,11 @@ class ApplicationContainer:
             base_url=settings.llm_base_url,
             stream_usage=True,
         )
-        agent = PaperAgentGraph(
+        agent = create_supervisor_agent(
             model=model,
             paper_search=paper_search,
             store=self.store,
-            max_tool_iterations=settings.max_tool_iterations,
+            max_steps=settings.supervisor_max_steps,
         )
         self.chat_service = ChatService(self.store, agent)
 

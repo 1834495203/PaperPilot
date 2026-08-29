@@ -1,16 +1,25 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { EventTimeline } from "@/components/event-timeline";
 import { MetricsPanel } from "@/components/metrics-panel";
 import {
   createConversation,
+  getConversationMetrics,
+  listConversationEvents,
   listConversations,
   listMessages,
   streamMessage,
 } from "@/lib/api";
-import type { AgentEvent, Conversation, JsonValue, Message, RunMetrics } from "@/lib/types";
+import type {
+  AgentEvent,
+  Conversation,
+  ConversationMetricsResponse,
+  JsonValue,
+  Message,
+  RunMetrics,
+} from "@/lib/types";
 
 const EMPTY_METRICS: RunMetrics = {
   inputTokens: 0,
@@ -19,7 +28,20 @@ const EMPTY_METRICS: RunMetrics = {
   llmCalls: 0,
   toolCalls: 0,
   durationMs: 0,
+  runCount: 0,
 };
+
+function fromConversationMetrics(metrics: ConversationMetricsResponse): RunMetrics {
+  return {
+    inputTokens: metrics.input_tokens,
+    outputTokens: metrics.output_tokens,
+    totalTokens: metrics.total_tokens,
+    llmCalls: metrics.llm_calls,
+    toolCalls: metrics.tool_calls,
+    durationMs: metrics.total_duration_ms,
+    runCount: metrics.run_count,
+  };
+}
 
 function numberValue(payload: Record<string, JsonValue>, key: string): number {
   const value = payload[key];
@@ -36,13 +58,21 @@ export function ChatWorkspace() {
   const [metrics, setMetrics] = useState<RunMetrics>(EMPTY_METRICS);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const metricsBaseline = useRef<RunMetrics>(EMPTY_METRICS);
 
   const loadConversation = useCallback(async (conversationId: string) => {
     setActiveId(conversationId);
-    setMessages(await listMessages(conversationId));
-    setEvents([]);
+    const [storedMessages, storedMetrics, storedEvents] = await Promise.all([
+      listMessages(conversationId),
+      getConversationMetrics(conversationId),
+      listConversationEvents(conversationId),
+    ]);
+    const restoredMetrics = fromConversationMetrics(storedMetrics);
+    setMessages(storedMessages);
+    setEvents(storedEvents);
     setStreamedAnswer("");
-    setMetrics(EMPTY_METRICS);
+    setMetrics(restoredMetrics);
+    metricsBaseline.current = restoredMetrics;
   }, []);
 
   useEffect(() => {
@@ -78,15 +108,30 @@ export function ChatWorkspace() {
     if (event.type === "message.completed" && event.payload.has_tool_calls === true) {
       setStreamedAnswer("");
     }
-    if (event.type === "metrics.updated" || event.type === "run.completed") {
+    if (event.type === "metrics.updated") {
+      const baseline = metricsBaseline.current;
       setMetrics({
-        inputTokens: numberValue(event.payload, "input_tokens"),
-        outputTokens: numberValue(event.payload, "output_tokens"),
-        totalTokens: numberValue(event.payload, "total_tokens"),
-        llmCalls: numberValue(event.payload, "llm_calls"),
-        toolCalls: numberValue(event.payload, "tool_calls"),
-        durationMs: numberValue(event.payload, "duration_ms"),
+        inputTokens: baseline.inputTokens + numberValue(event.payload, "input_tokens"),
+        outputTokens: baseline.outputTokens + numberValue(event.payload, "output_tokens"),
+        totalTokens: baseline.totalTokens + numberValue(event.payload, "total_tokens"),
+        llmCalls: baseline.llmCalls + numberValue(event.payload, "llm_calls"),
+        toolCalls: baseline.toolCalls + numberValue(event.payload, "tool_calls"),
+        durationMs: baseline.durationMs,
+        runCount: baseline.runCount,
       });
+    }
+    if (event.type === "run.completed" || event.type === "run.failed") {
+      const cumulativeMetrics: RunMetrics = {
+        inputTokens: numberValue(event.payload, "conversation_input_tokens"),
+        outputTokens: numberValue(event.payload, "conversation_output_tokens"),
+        totalTokens: numberValue(event.payload, "conversation_total_tokens"),
+        llmCalls: numberValue(event.payload, "conversation_llm_calls"),
+        toolCalls: numberValue(event.payload, "conversation_tool_calls"),
+        durationMs: numberValue(event.payload, "conversation_total_duration_ms"),
+        runCount: numberValue(event.payload, "conversation_run_count"),
+      };
+      metricsBaseline.current = cumulativeMetrics;
+      setMetrics(cumulativeMetrics);
     }
     if (event.type === "run.failed") {
       const message = event.payload.error;
@@ -101,9 +146,8 @@ export function ChatWorkspace() {
 
     setDraft("");
     setError(null);
-    setEvents([]);
     setStreamedAnswer("");
-    setMetrics(EMPTY_METRICS);
+    metricsBaseline.current = metrics;
     setIsRunning(true);
     setMessages((current) => [
       ...current,
@@ -161,7 +205,7 @@ export function ChatWorkspace() {
 
       <section className="chat-column">
         <header>
-          <div><span className={isRunning ? "status running" : "status"} /> Single Research Agent</div>
+          <div><span className={isRunning ? "status running" : "status"} /> Supervisor Research Team</div>
           <span>{isRunning ? "执行中" : "Ready"}</span>
         </header>
         <div className="messages">
@@ -206,4 +250,3 @@ export function ChatWorkspace() {
     </main>
   );
 }
-

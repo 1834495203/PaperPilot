@@ -2,7 +2,14 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from uuid import UUID
 
-from app.domain.entities import AgentEvent, AgentRun, Conversation, Message, RunMetrics
+from app.domain.entities import (
+    AgentEvent,
+    AgentRun,
+    Conversation,
+    ConversationMetrics,
+    Message,
+    RunMetrics,
+)
 from app.domain.enums import MessageRole, RunStatus
 from app.domain.papers import ArxivSearchInput, Paper
 from app.domain.types import JsonValue
@@ -20,6 +27,13 @@ class ConversationStore(ABC):
 
     @abstractmethod
     async def list_messages(self, conversation_id: UUID) -> Sequence[Message]: ...
+
+    @abstractmethod
+    async def list_events(
+        self,
+        conversation_id: UUID,
+        limit: int,
+    ) -> Sequence[AgentEvent]: ...
 
     @abstractmethod
     async def append_message(
@@ -41,6 +55,18 @@ class ConversationStore(ABC):
         metrics: RunMetrics,
         error: str | None = None,
     ) -> None: ...
+
+    @abstractmethod
+    async def get_conversation_metrics(
+        self,
+        conversation_id: UUID,
+    ) -> ConversationMetrics: ...
+
+    @abstractmethod
+    async def refresh_conversation_metrics(
+        self,
+        conversation_id: UUID,
+    ) -> ConversationMetrics: ...
 
     @abstractmethod
     async def append_tool_call(

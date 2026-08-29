@@ -53,6 +53,22 @@ class AgentRunRow(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ConversationMetricsRow(Base):
+    __tablename__ = "conversation_metrics"
+
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    llm_calls: Mapped[int] = mapped_column(Integer, default=0)
+    tool_calls: Mapped[int] = mapped_column(Integer, default=0)
+    total_duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    run_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class ToolCallRow(Base):
     __tablename__ = "tool_calls"
     __table_args__ = (Index("ix_tool_calls_run_created", "run_id", "created_at"),)
@@ -86,4 +102,3 @@ class AgentEventRow(Base):
     event_type: Mapped[str] = mapped_column(String(50), nullable=False)
     payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-

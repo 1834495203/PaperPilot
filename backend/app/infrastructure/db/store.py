@@ -9,17 +9,19 @@ from app.domain.entities import (
     AgentEvent,
     AgentRun,
     Conversation,
+    ConversationMetrics,
     Message,
     RunMetrics,
     utc_now,
 )
-from app.domain.enums import MessageRole, RunStatus
+from app.domain.enums import PERSISTED_AGENT_EVENT_TYPES, EventType, MessageRole, RunStatus
 from app.domain.ports import ConversationStore
 from app.domain.types import JsonValue
 from app.infrastructure.db.models import (
     AgentEventRow,
     AgentRunRow,
     Base,
+    ConversationMetricsRow,
     ConversationRow,
     MessageRow,
     ToolCallRow,
@@ -70,6 +72,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             ).all()
         return [self._to_message(row) for row in rows]
+
+    async def list_events(
+        self,
+        conversation_id: UUID,
+        limit: int,
+    ) -> Sequence[AgentEvent]:
+        persisted_type_values = [event_type.value for event_type in PERSISTED_AGENT_EVENT_TYPES]
+        async with self._session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(AgentEventRow)
+                    .where(
+                        AgentEventRow.conversation_id == str(conversation_id),
+                        AgentEventRow.event_type.in_(persisted_type_values),
+                    )
+                    .order_by(AgentEventRow.created_at.desc(), AgentEventRow.sequence.desc())
+                    .limit(limit)
+                )
+            ).all()
+        return [self._to_event(row) for row in reversed(rows)]
 
     async def append_message(
         self,
@@ -140,6 +162,66 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
             await session.commit()
+
+    async def get_conversation_metrics(
+        self,
+        conversation_id: UUID,
+    ) -> ConversationMetrics:
+        return await self.refresh_conversation_metrics(conversation_id)
+
+    async def refresh_conversation_metrics(
+        self,
+        conversation_id: UUID,
+    ) -> ConversationMetrics:
+        async with self._session_factory() as session:
+            totals = (
+                await session.execute(
+                    select(
+                        func.coalesce(func.sum(AgentRunRow.input_tokens), 0),
+                        func.coalesce(func.sum(AgentRunRow.output_tokens), 0),
+                        func.coalesce(func.sum(AgentRunRow.total_tokens), 0),
+                        func.coalesce(func.sum(AgentRunRow.llm_calls), 0),
+                        func.coalesce(func.sum(AgentRunRow.tool_calls), 0),
+                        func.coalesce(func.sum(AgentRunRow.duration_ms), 0),
+                        func.count(AgentRunRow.id),
+                    ).where(
+                        AgentRunRow.conversation_id == str(conversation_id),
+                        AgentRunRow.status.in_(
+                            [RunStatus.COMPLETED.value, RunStatus.FAILED.value]
+                        ),
+                    )
+                )
+            ).one()
+            row = await session.scalar(
+                select(ConversationMetricsRow)
+                .where(ConversationMetricsRow.conversation_id == str(conversation_id))
+                .with_for_update()
+            )
+            if row is None:
+                row = ConversationMetricsRow(
+                    conversation_id=str(conversation_id),
+                    input_tokens=0,
+                    output_tokens=0,
+                    total_tokens=0,
+                    llm_calls=0,
+                    tool_calls=0,
+                    total_duration_ms=0,
+                    run_count=0,
+                    updated_at=utc_now(),
+                )
+                session.add(row)
+
+            row.input_tokens = int(totals[0])
+            row.output_tokens = int(totals[1])
+            row.total_tokens = int(totals[2])
+            row.llm_calls = int(totals[3])
+            row.tool_calls = int(totals[4])
+            row.total_duration_ms = int(totals[5])
+            row.run_count = int(totals[6])
+            row.updated_at = utc_now()
+            await session.commit()
+            await session.refresh(row)
+        return self._to_conversation_metrics(row)
 
     async def append_tool_call(
         self,
@@ -221,4 +303,30 @@ class SqlAlchemyConversationStore(ConversationStore):
             error=row.error,
             started_at=row.started_at,
             completed_at=row.completed_at,
+        )
+
+    @staticmethod
+    def _to_conversation_metrics(row: ConversationMetricsRow) -> ConversationMetrics:
+        return ConversationMetrics(
+            conversation_id=UUID(row.conversation_id),
+            input_tokens=row.input_tokens,
+            output_tokens=row.output_tokens,
+            total_tokens=row.total_tokens,
+            llm_calls=row.llm_calls,
+            tool_calls=row.tool_calls,
+            total_duration_ms=row.total_duration_ms,
+            run_count=row.run_count,
+            updated_at=row.updated_at,
+        )
+
+    @staticmethod
+    def _to_event(row: AgentEventRow) -> AgentEvent:
+        return AgentEvent(
+            id=UUID(row.id),
+            run_id=UUID(row.run_id),
+            conversation_id=UUID(row.conversation_id),
+            sequence=row.sequence,
+            type=EventType(row.event_type),
+            timestamp=row.created_at,
+            payload=cast(dict[str, JsonValue], row.payload),
         )

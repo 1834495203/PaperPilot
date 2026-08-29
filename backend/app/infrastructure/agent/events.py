@@ -1,13 +1,36 @@
 import asyncio
+import logging
+from dataclasses import replace
 from uuid import UUID
 
 from app.domain.entities import AgentEvent
-from app.domain.enums import EventType
+from app.domain.enums import PERSISTED_AGENT_EVENT_TYPES, EventType
 from app.domain.ports import ConversationStore, EventPublisher
 from app.domain.types import JsonValue
 
 
-class PersistentQueueEventPublisher(EventPublisher):
+class EventPersistencePolicy:
+    def prepare_for_storage(self, event: AgentEvent) -> AgentEvent | None:
+        if event.type not in PERSISTED_AGENT_EVENT_TYPES:
+            return None
+        if event.type is not EventType.TOOL_COMPLETED:
+            return event
+
+        compact_payload = {
+            key: value
+            for key, value in event.payload.items()
+            if key
+            in {
+                "tool_call_id",
+                "tool_name",
+                "result_count",
+                "duration_ms",
+            }
+        }
+        return replace(event, payload=compact_payload)
+
+
+class RunEventPublisher(EventPublisher):
     def __init__(
         self,
         *,
@@ -15,11 +38,15 @@ class PersistentQueueEventPublisher(EventPublisher):
         conversation_id: UUID,
         store: ConversationStore,
         queue: asyncio.Queue[AgentEvent],
+        persistence_policy: EventPersistencePolicy | None = None,
+        logger: logging.Logger | None = None,
     ) -> None:
         self._run_id = run_id
         self._conversation_id = conversation_id
         self._store = store
         self._queue = queue
+        self._persistence_policy = persistence_policy or EventPersistencePolicy()
+        self._logger = logger or logging.getLogger(__name__)
         self._sequence = 0
 
     async def publish(
@@ -35,5 +62,20 @@ class PersistentQueueEventPublisher(EventPublisher):
             event_type=EventType(event_type),
             payload=payload,
         )
-        await self._store.append_event(event)
+        stored_event = self._persistence_policy.prepare_for_storage(event)
+        if stored_event is not None:
+            await self._store.append_event(stored_event)
+        self._write_log(event)
         await self._queue.put(event)
+
+    def _write_log(self, event: AgentEvent) -> None:
+        if event.type is EventType.TOKEN:
+            return
+        log_level = logging.ERROR if event.type is EventType.RUN_FAILED else logging.INFO
+        self._logger.log(
+            log_level,
+            "agent_event type=%s run_id=%s sequence=%d",
+            event.type.value,
+            event.run_id,
+            event.sequence,
+        )

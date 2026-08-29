@@ -54,6 +54,19 @@ class RunMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class ConversationMetrics:
+    conversation_id: UUID
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    llm_calls: int = 0
+    tool_calls: int = 0
+    total_duration_ms: int = 0
+    run_count: int = 0
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AgentRun:
     id: UUID
     conversation_id: UUID

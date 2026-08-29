@@ -17,6 +17,7 @@ class RunStatus(StrEnum):
 class EventType(StrEnum):
     RUN_STARTED = "run.started"
     STAGE_STARTED = "stage.started"
+    DECISION_RECORDED = "decision.recorded"
     TOKEN = "message.token"
     MESSAGE_COMPLETED = "message.completed"
     TOOL_STARTED = "tool.started"
@@ -26,3 +27,17 @@ class EventType(StrEnum):
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"
 
+
+PERSISTED_AGENT_EVENT_TYPES: frozenset[EventType] = frozenset(
+    {
+        EventType.RUN_STARTED,
+        EventType.STAGE_STARTED,
+        EventType.DECISION_RECORDED,
+        EventType.TOOL_STARTED,
+        EventType.TOOL_COMPLETED,
+        EventType.TOOL_FAILED,
+        EventType.METRICS_UPDATED,
+        EventType.RUN_COMPLETED,
+        EventType.RUN_FAILED,
+    }
+)

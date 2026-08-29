@@ -3,11 +3,12 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
 from app.api.dependencies import get_chat_service
 from app.api.schemas import (
+    ConversationMetricsResponse,
     ConversationResponse,
     CreateConversationRequest,
     EventResponse,
@@ -49,6 +50,37 @@ async def list_messages(
             detail="Conversation not found",
         ) from error
     return [MessageResponse.from_domain(item) for item in messages]
+
+
+@router.get("/{conversation_id}/metrics", response_model=ConversationMetricsResponse)
+async def get_conversation_metrics(
+    conversation_id: UUID,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+) -> ConversationMetricsResponse:
+    try:
+        metrics = await service.get_conversation_metrics(conversation_id)
+    except ConversationNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        ) from error
+    return ConversationMetricsResponse.from_domain(metrics)
+
+
+@router.get("/{conversation_id}/events", response_model=list[EventResponse])
+async def list_events(
+    conversation_id: UUID,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> list[EventResponse]:
+    try:
+        events = await service.get_events(conversation_id, limit)
+    except ConversationNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        ) from error
+    return [EventResponse.from_domain(event) for event in events]
 
 
 @router.post("/{conversation_id}/messages/stream")

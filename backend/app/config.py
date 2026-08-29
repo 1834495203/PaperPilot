@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     arxiv_api_url: str = "https://export.arxiv.org/api/query"
     arxiv_timeout_seconds: float = 20.0
     max_tool_iterations: int = Field(default=3, ge=1, le=8)
+    supervisor_max_steps: int = Field(default=8, ge=2, le=20)
 
 
 @lru_cache(maxsize=1)

@@ -3,7 +3,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.domain.entities import AgentEvent, Conversation, Message
+from app.domain.entities import AgentEvent, Conversation, ConversationMetrics, Message
 from app.domain.enums import MessageRole
 from app.domain.types import JsonValue
 
@@ -55,6 +55,32 @@ class MessageResponse(BaseModel):
             sequence=message.sequence,
             created_at=message.created_at,
             metadata=message.metadata,
+        )
+
+
+class ConversationMetricsResponse(BaseModel):
+    conversation_id: UUID
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    llm_calls: int
+    tool_calls: int
+    total_duration_ms: int
+    run_count: int
+    updated_at: datetime | None
+
+    @classmethod
+    def from_domain(cls, metrics: ConversationMetrics) -> "ConversationMetricsResponse":
+        return cls(
+            conversation_id=metrics.conversation_id,
+            input_tokens=metrics.input_tokens,
+            output_tokens=metrics.output_tokens,
+            total_tokens=metrics.total_tokens,
+            llm_calls=metrics.llm_calls,
+            tool_calls=metrics.tool_calls,
+            total_duration_ms=metrics.total_duration_ms,
+            run_count=metrics.run_count,
+            updated_at=metrics.updated_at,
         )
 
 

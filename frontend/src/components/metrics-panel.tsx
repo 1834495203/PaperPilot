@@ -13,6 +13,7 @@ export function MetricsPanel({ metrics }: MetricsPanelProps) {
     ["输入 / 输出", `${metrics.inputTokens} / ${metrics.outputTokens}`],
     ["LLM 调用", metrics.llmCalls.toString()],
     ["工具调用", metrics.toolCalls.toString()],
+    ["累计运行", metrics.runCount.toString()],
   ];
 
   return (
@@ -26,4 +27,3 @@ export function MetricsPanel({ metrics }: MetricsPanelProps) {
     </section>
   );
 }
-

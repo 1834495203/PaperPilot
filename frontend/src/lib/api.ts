@@ -1,4 +1,9 @@
-import type { AgentEvent, Conversation, Message } from "@/lib/types";
+import type {
+  AgentEvent,
+  Conversation,
+  ConversationMetricsResponse,
+  Message,
+} from "@/lib/types";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
@@ -39,6 +44,25 @@ export function listMessages(conversationId: string): Promise<Message[]> {
   });
 }
 
+export function getConversationMetrics(
+  conversationId: string,
+): Promise<ConversationMetricsResponse> {
+  return requestJson<ConversationMetricsResponse>(
+    `/conversations/${conversationId}/metrics`,
+    { cache: "no-store" },
+  );
+}
+
+export function listConversationEvents(
+  conversationId: string,
+  limit = 200,
+): Promise<AgentEvent[]> {
+  return requestJson<AgentEvent[]>(
+    `/conversations/${conversationId}/events?limit=${limit}`,
+    { cache: "no-store" },
+  );
+}
+
 export async function streamMessage(
   conversationId: string,
   content: string,
@@ -77,4 +101,3 @@ export async function streamMessage(
     }
   }
 }
-

@@ -23,6 +23,7 @@ export interface Message {
 export type AgentEventType =
   | "run.started"
   | "stage.started"
+  | "decision.recorded"
   | "message.token"
   | "message.completed"
   | "tool.started"
@@ -49,6 +50,19 @@ export interface RunMetrics {
   llmCalls: number;
   toolCalls: number;
   durationMs: number;
+  runCount: number;
+}
+
+export interface ConversationMetricsResponse {
+  conversation_id: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  llm_calls: number;
+  tool_calls: number;
+  total_duration_ms: number;
+  run_count: number;
+  updated_at: string | null;
 }
 
 export interface PaperResult {
