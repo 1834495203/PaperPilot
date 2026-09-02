@@ -67,4 +67,4 @@ class SupervisorGraphBuilder:
         decision = state["decision"]
         if decision is None:
             raise ValueError("Supervisor must produce a routing decision")
-        return decision.next_agent.value
+        return decision.task.agent.value

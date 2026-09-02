@@ -129,8 +129,7 @@ class ChatModelGateway(AgentModelGateway):
         token_consumer: TokenConsumer | None = None,
     ) -> TextModelResult:
         complete_chunk: AIMessageChunk | None = None
-        async for raw_chunk in self._model.astream(messages):
-            chunk = cast(AIMessageChunk, raw_chunk)
+        async for chunk in self._model.astream(messages):
             complete_chunk = chunk if complete_chunk is None else complete_chunk + chunk
             text = text_from_message_content(chunk.content)
             if text and token_consumer is not None:

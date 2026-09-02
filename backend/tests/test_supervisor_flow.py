@@ -24,8 +24,15 @@ from app.infrastructure.agent.supervisor.model_gateway import (
 )
 from app.infrastructure.agent.supervisor.models import (
     AgentName,
+    AnalystTask,
+    DecisionAssessment,
     DecisionSource,
+    PaperAssessment,
+    PaperRelevance,
+    SearchScreening,
+    SearchTask,
     SupervisorDecision,
+    WriterTask,
 )
 from app.infrastructure.agent.supervisor.reader_agent import ReaderAgentNode
 from app.infrastructure.agent.supervisor.search_agent import SearchAgentNode
@@ -56,24 +63,41 @@ async def test_supervisor_routes_search_result_back_to_writer() -> None:
     structured.side_effect = [
         StructuredModelResult(
             value=SupervisorDecision(
-                next_agent=AgentName.SEARCH,
-                observations=["The user asks for an external paper"],
-                missing_information=["No paper evidence is available yet"],
-                objective="Find a relevant paper",
-                decision_summary="External paper evidence is required",
-                success_criteria=["Return at least one relevant arXiv paper"],
-                query="retrieval augmented generation hallucination evaluation",
+                assessment=DecisionAssessment(
+                    observations=["The user asks for an external paper"],
+                    missing_information=["No paper evidence is available yet"],
+                    decision_summary="External paper evidence is required",
+                ),
+                task=SearchTask(
+                    objective="Find a relevant paper",
+                    query="retrieval augmented generation hallucination evaluation",
+                ),
             ),
             usage=ModelUsage(input_tokens=10, output_tokens=5, total_tokens=15),
         ),
         StructuredModelResult(
+            value=SearchScreening(
+                screening_summary="The returned paper directly matches the topic",
+                assessments=[
+                    PaperAssessment(
+                        arxiv_id="2401.00001",
+                        relevance=PaperRelevance.DIRECT,
+                        relevance_reason="It evaluates hallucinations in RAG",
+                        matched_topics=["RAG", "hallucination evaluation"],
+                    )
+                ],
+                continue_search=False,
+            ),
+            usage=ModelUsage(input_tokens=3, output_tokens=2, total_tokens=5),
+        ),
+        StructuredModelResult(
             value=SupervisorDecision(
-                next_agent=AgentName.WRITER,
-                observations=["The search returned a relevant paper"],
-                missing_information=[],
-                objective="Present the discovered paper",
-                decision_summary="The search result satisfies the request",
-                success_criteria=["Give the paper title and source URL"],
+                assessment=DecisionAssessment(
+                    observations=["The search returned a relevant paper"],
+                    missing_information=[],
+                    decision_summary="The search result satisfies the request",
+                ),
+                task=WriterTask(objective="Present the discovered paper"),
             ),
             usage=ModelUsage(input_tokens=12, output_tokens=4, total_tokens=16),
         ),
@@ -168,9 +192,9 @@ async def test_supervisor_routes_search_result_back_to_writer() -> None:
         AgentName.SEARCH,
         AgentName.WRITER,
     ]
-    assert result["llm_calls"] == 4
+    assert result["llm_calls"] == 5
     assert result["tool_calls"] == 1
-    assert result["total_tokens"] == 58
+    assert result["total_tokens"] == 63
     cast(AsyncMock, recorder.record_tool_execution).assert_awaited_once()
     cast(AsyncMock, recorder.record_assistant_message).assert_awaited_once()
     stage_names = [
@@ -207,16 +231,19 @@ def test_supervisor_keeps_model_decision_separate_from_policy_override() -> None
         tool_calls=0,
     )
     model_decision = SupervisorDecision(
-        next_agent=AgentName.ANALYST,
-        observations=["The user requests novelty analysis"],
-        missing_information=["No prior-art evidence is available"],
-        objective="Assess novelty",
-        decision_summary="Novelty analysis is needed",
-        success_criteria=["Compare the idea with prior work"],
+        assessment=DecisionAssessment(
+            observations=["The user requests novelty analysis"],
+            missing_information=["No prior-art evidence is available"],
+            decision_summary="Novelty analysis is needed",
+        ),
+        task=AnalystTask(
+            objective="Assess novelty",
+            source_artifact_ids=[uuid4()],
+        ),
     )
 
     resolution = SupervisorNode._normalize_decision(state, model_decision)
 
-    assert model_decision.next_agent is AgentName.ANALYST
-    assert resolution.decision.next_agent is AgentName.SEARCH
-    assert resolution.adjustments[0].rule == "analyst_requires_artifacts"
+    assert model_decision.task.agent is AgentName.ANALYST
+    assert resolution.decision.task.agent is AgentName.SEARCH
+    assert resolution.adjustments[-1].rule == "analyst_requires_sources"

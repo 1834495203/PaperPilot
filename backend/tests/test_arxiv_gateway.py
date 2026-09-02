@@ -1,4 +1,8 @@
-from app.infrastructure.tools.arxiv import ArxivPaperSearchGateway
+import httpx
+import pytest
+
+from app.domain.papers import ArxivSearchInput
+from app.infrastructure.tools.arxiv import ArxivApiError, ArxivPaperSearchGateway
 
 
 def test_parse_feed_returns_typed_paper() -> None:
@@ -23,3 +27,71 @@ def test_parse_feed_returns_typed_paper() -> None:
     assert papers[0].summary == "First line. Second line."
     assert papers[0].authors == ["Ada Lovelace"]
 
+
+def test_known_arxiv_id_uses_exact_id_list() -> None:
+    params = ArxivPaperSearchGateway._build_params(
+        ArxivSearchInput(query="Read arXiv:2409.13740 and summarize it", max_results=10)
+    )
+
+    assert params["id_list"] == "2409.13740"
+    assert "search_query" not in params
+
+
+def test_keyword_query_scopes_every_term() -> None:
+    params = ArxivPaperSearchGateway._build_params(
+        ArxivSearchInput(query='PaperQA "scientific literature QA"', max_results=5)
+    )
+
+    assert params["search_query"] == 'all:PaperQA AND all:"scientific literature QA"'
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_is_retried_once_and_then_succeeds() -> None:
+    responses = iter(
+        [
+            httpx.Response(429, headers={"Retry-After": "0"}),
+            httpx.Response(200, text="<feed />"),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = next(responses)
+        response.request = request
+        return response
+
+    gateway = ArxivPaperSearchGateway(
+        "https://export.arxiv.org/api/query",
+        5,
+        min_request_interval_seconds=0,
+        max_retries=1,
+        retry_backoff_seconds=0,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await gateway._request_with_retry(client, {"search_query": "all:test"})
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_final_rate_limit_exposes_structured_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "12"},
+            request=request,
+        )
+
+    gateway = ArxivPaperSearchGateway(
+        "https://export.arxiv.org/api/query",
+        5,
+        min_request_interval_seconds=0,
+        max_retries=0,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ArxivApiError) as raised:
+            await gateway._request_with_retry(client, {"search_query": "all:test"})
+
+    assert raised.value.category == "rate_limited"
+    assert raised.value.retryable is True
+    assert raised.value.status_code == 429
+    assert raised.value.retry_after_seconds == 12

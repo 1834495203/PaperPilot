@@ -64,6 +64,7 @@ async def test_conversation_metrics_refresh_from_run_history(tmp_path: Path) -> 
         ),
     )
     accumulated = await store.refresh_conversation_metrics(conversation.id)
+    runs = await store.list_runs(conversation.id)
 
     assert first_snapshot.total_tokens == 140
     assert accumulated.total_tokens == 220
@@ -71,7 +72,31 @@ async def test_conversation_metrics_refresh_from_run_history(tmp_path: Path) -> 
     assert accumulated.llm_calls == 3
     assert accumulated.tool_calls == 1
     assert accumulated.run_count == 2
+    assert [run.id for run in runs] == [first_run.id, second_run.id]
+    assert runs[0].metrics.total_tokens == 140
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_marks_orphaned_running_runs_as_cancelled(tmp_path: Path) -> None:
+    database_path = (tmp_path / "paperpilot-restart-test.db").as_posix()
+    first_engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    first_store = SqlAlchemyConversationStore(first_engine)
+    await first_store.initialize()
+    conversation = await first_store.create_conversation("Restart")
+    run = await first_store.create_run(conversation.id)
+    await first_store.close()
+
+    second_engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    second_store = SqlAlchemyConversationStore(second_engine)
+    await second_store.initialize()
+    runs = await second_store.list_runs(conversation.id)
+
+    assert runs[0].id == run.id
+    assert runs[0].status is RunStatus.CANCELLED
+    assert runs[0].error == "Backend restarted before the run completed"
+    assert runs[0].completed_at is not None
+    await second_store.close()
 
 
 @pytest.mark.asyncio
@@ -106,4 +131,32 @@ async def test_list_events_excludes_legacy_token_events(tmp_path: Path) -> None:
     events = await store.list_events(conversation.id, limit=100)
 
     assert [event.type for event in events] == [EventType.STAGE_STARTED]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_conversation_removes_its_dependent_records(tmp_path: Path) -> None:
+    database_path = (tmp_path / "paperpilot-delete-test.db").as_posix()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    store = SqlAlchemyConversationStore(engine)
+    await store.initialize()
+    conversation = await store.create_conversation("Delete me")
+    await store.append_message(conversation.id, MessageRole.USER, "Question")
+    run = await store.create_run(conversation.id)
+    await store.append_event(
+        AgentEvent.create(
+            run_id=run.id,
+            conversation_id=conversation.id,
+            sequence=1,
+            event_type=EventType.STAGE_STARTED,
+            payload={"summary": "Started"},
+        )
+    )
+    await store.refresh_conversation_metrics(conversation.id)
+
+    assert await store.delete_conversation(conversation.id) is True
+    assert await store.get_conversation(conversation.id) is None
+    assert await store.list_messages(conversation.id) == []
+    assert await store.list_events(conversation.id, limit=10) == []
+    assert await store.delete_conversation(conversation.id) is False
     await store.close()

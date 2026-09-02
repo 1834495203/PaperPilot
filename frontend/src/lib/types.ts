@@ -31,7 +31,8 @@ export type AgentEventType =
   | "tool.failed"
   | "metrics.updated"
   | "run.completed"
-  | "run.failed";
+  | "run.failed"
+  | "run.cancelled";
 
 export interface AgentEvent {
   id: string;
@@ -65,6 +66,21 @@ export interface ConversationMetricsResponse {
   updated_at: string | null;
 }
 
+export interface AgentRun {
+  id: string;
+  conversation_id: string;
+  status: "running" | "completed" | "failed" | "cancelled";
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  llm_calls: number;
+  tool_calls: number;
+  duration_ms: number;
+  error: string | null;
+  started_at: string;
+  completed_at: string | null;
+}
+
 export interface PaperResult {
   [key: string]: JsonValue;
   arxiv_id: string;
@@ -75,4 +91,40 @@ export interface PaperResult {
   updated_at: string;
   abstract_url: string;
   pdf_url: string | null;
+}
+
+export interface IndexedPaper {
+  paper_id: string;
+  title: string;
+  authors: string[];
+  abstract: string | null;
+  keywords: string[];
+  doi: string | null;
+  arxiv_id: string | null;
+  original_filename: string;
+  page_count: number;
+  section_count: number;
+  node_count: number;
+  chunk_count: number;
+  created_at: string;
+}
+
+export type PaperTreeNodeType = "root" | "section" | "chunk";
+
+export interface PaperTreeNode {
+  node_id: string;
+  node_type: PaperTreeNodeType;
+  title: string;
+  parent_id: string | null;
+  children_ids: string[];
+  level: number;
+  section_path: string[];
+  page_start: number | null;
+  page_end: number | null;
+  text_preview: string;
+}
+
+export interface IndexedPaperDetail {
+  paper: IndexedPaper;
+  nodes: PaperTreeNode[];
 }

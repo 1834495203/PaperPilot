@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import conversations, health
+from app.api.routes import conversations, health, papers
 from app.config import get_settings
 from app.container import ApplicationContainer
 
@@ -32,6 +32,7 @@ def create_app() -> FastAPI:
     )
     application.include_router(health.router, prefix=settings.api_prefix)
     application.include_router(conversations.router, prefix=settings.api_prefix)
+    application.include_router(papers.router, prefix=settings.api_prefix)
     return application
 
 

@@ -14,6 +14,7 @@ class AgentRunContext:
     conversation_id: UUID
     run_id: UUID
     publisher: EventPublisher
+    paper_ids: tuple[str, ...] = ()
 
 
 class AgentRunner(ABC):

@@ -1,8 +1,11 @@
 import type {
   AgentEvent,
+  AgentRun,
   Conversation,
   ConversationMetricsResponse,
   Message,
+  IndexedPaper,
+  IndexedPaperDetail,
 } from "@/lib/types";
 
 const API_BASE_URL =
@@ -38,10 +41,35 @@ export function createConversation(title: string): Promise<Conversation> {
   });
 }
 
+export async function deleteConversation(conversationId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/conversations/${conversationId}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new ApiError(await response.text(), response.status);
+  }
+}
+
 export function listMessages(conversationId: string): Promise<Message[]> {
   return requestJson<Message[]>(`/conversations/${conversationId}/messages`, {
     cache: "no-store",
   });
+}
+
+export function listIndexedPapers(): Promise<IndexedPaper[]> {
+  return requestJson<IndexedPaper[]>("/papers", { cache: "no-store" });
+}
+
+export function getIndexedPaperDetail(paperId: string): Promise<IndexedPaperDetail> {
+  return requestJson<IndexedPaperDetail>(`/papers/${encodeURIComponent(paperId)}`, {
+    cache: "no-store",
+  });
+}
+
+export function uploadPaper(file: File): Promise<IndexedPaper> {
+  const body = new FormData();
+  body.append("file", file);
+  return requestJson<IndexedPaper>("/papers", { method: "POST", body });
 }
 
 export function getConversationMetrics(
@@ -53,9 +81,25 @@ export function getConversationMetrics(
   );
 }
 
+export function listConversationRuns(conversationId: string): Promise<AgentRun[]> {
+  return requestJson<AgentRun[]>(`/conversations/${conversationId}/runs`, {
+    cache: "no-store",
+  });
+}
+
+export async function cancelRun(conversationId: string, runId: string): Promise<void> {
+  const response = await fetch(
+    `${API_BASE_URL}/conversations/${conversationId}/runs/${runId}/cancel`,
+    { method: "POST" },
+  );
+  if (!response.ok && response.status !== 409) {
+    throw new ApiError(await response.text(), response.status);
+  }
+}
+
 export function listConversationEvents(
   conversationId: string,
-  limit = 200,
+  limit = 500,
 ): Promise<AgentEvent[]> {
   return requestJson<AgentEvent[]>(
     `/conversations/${conversationId}/events?limit=${limit}`,
@@ -66,6 +110,7 @@ export function listConversationEvents(
 export async function streamMessage(
   conversationId: string,
   content: string,
+  paperIds: string[],
   onEvent: (event: AgentEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -74,7 +119,7 @@ export async function streamMessage(
     {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content, paper_ids: paperIds }),
       ...(signal === undefined ? {} : { signal }),
     },
   );

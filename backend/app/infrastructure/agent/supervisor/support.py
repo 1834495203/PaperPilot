@@ -47,31 +47,40 @@ def select_artifacts(
     artifacts: Sequence[AgentArtifact],
     artifact_ids: Sequence[UUID],
 ) -> list[AgentArtifact]:
-    if not artifact_ids:
-        return list(artifacts)
     selected_ids = set(artifact_ids)
     return [artifact for artifact in artifacts if artifact.id in selected_ids]
 
 
 def render_artifacts(
     artifacts: Sequence[AgentArtifact],
-    *,
-    max_content_chars: int = 24_000,
 ) -> str:
-    remaining = max_content_chars
-    rendered: list[dict[str, object]] = []
-    for artifact in artifacts:
-        if remaining <= 0:
-            break
-        content = artifact.content[:remaining]
-        remaining -= len(content)
-        rendered.append(
+    return json.dumps(
+        [
             {
                 "id": str(artifact.id),
                 "kind": artifact.kind.value,
                 "title": artifact.title,
-                "summary": artifact.summary,
-                "content": content,
+                "content": artifact.content,
             }
-        )
-    return json.dumps(rendered, ensure_ascii=False)
+            for artifact in artifacts
+        ],
+        ensure_ascii=False,
+    )
+
+
+def render_supervisor_context(
+    artifacts: Sequence[AgentArtifact],
+) -> str:
+    """Expose only Agent-authored summaries; detailed reports stay opaque to Supervisor."""
+
+    return json.dumps(
+        [
+            {
+                "id": str(artifact.id),
+                "title": artifact.title,
+                "summary": artifact.supervisor_summary.model_dump(mode="json"),
+            }
+            for artifact in artifacts
+        ],
+        ensure_ascii=False,
+    )

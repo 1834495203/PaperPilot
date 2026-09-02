@@ -14,6 +14,11 @@ function readNumber(payload: Record<string, JsonValue>, key: string): number | u
   return typeof value === "number" ? value : undefined;
 }
 
+function readBoolean(payload: Record<string, JsonValue>, key: string): boolean | undefined {
+  const value = payload[key];
+  return typeof value === "boolean" ? value : undefined;
+}
+
 function readStringArray(payload: Record<string, JsonValue>, key: string): string[] {
   const value = payload[key];
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
@@ -71,13 +76,31 @@ function eventLabel(event: AgentEvent): string {
       if (readString(event.payload, "actor") === "supervisor") {
         return `Supervisor 选择 ${readString(event.payload, "next_agent") ?? "下一步"}`;
       }
-      if (readString(event.payload, "actor") === "search") return "Search 生成工具调用";
-      if (readString(event.payload, "actor") === "reader") return "Reader 形成阅读结论";
+      if (readString(event.payload, "actor") === "search") {
+        return readString(event.payload, "stage") === "screening"
+          ? "Search 完成候选筛选"
+          : "Search 生成工具调用";
+      }
+      if (readString(event.payload, "actor") === "reader") {
+        if (readString(event.payload, "stage") === "reader.plan") return "Reader 制定检索计划";
+        if (readString(event.payload, "stage") === "reader.assess") return "Reader 评估证据覆盖";
+        return "Reader 形成阅读结论";
+      }
       if (readString(event.payload, "actor") === "analyst") return "Analyst 形成分析结论";
       return "Agent 已记录决策";
     case "tool.started":
       return `调用 ${readString(event.payload, "tool_name") ?? "工具"}`;
     case "tool.completed":
+      if (readString(event.payload, "tool_name") === "fetch_arxiv_pdf") {
+        return `PDF 解析完成 · ${readNumber(event.payload, "extracted_pages") ?? 0} 页`;
+      }
+      if (readString(event.payload, "tool_name") === "retrieve_indexed_paper") {
+        return [
+          `向量召回 ${readNumber(event.payload, "initial_hit_count") ?? 0}`,
+          `树扩展 ${readNumber(event.payload, "expanded_candidate_count") ?? 0}`,
+          `rerank 返回 ${readNumber(event.payload, "hit_count") ?? 0}`,
+        ].join(" · ");
+      }
       return `工具返回 ${readNumber(event.payload, "result_count") ?? 0} 篇论文`;
     case "tool.failed":
       return `工具失败：${readString(event.payload, "error") ?? "未知错误"}`;
@@ -89,6 +112,8 @@ function eventLabel(event: AgentEvent): string {
       return "任务完成";
     case "run.failed":
       return `任务失败：${readString(event.payload, "error") ?? "未知错误"}`;
+    case "run.cancelled":
+      return readString(event.payload, "summary") ?? "任务已停止";
     case "message.token":
       return "";
   }
@@ -112,6 +137,39 @@ function DetailGroup({ label, values }: DetailGroupProps) {
 }
 
 function EventDetails({ event }: { event: AgentEvent }) {
+  if (event.type === "tool.failed") {
+    const category = readString(event.payload, "error_category");
+    const statusCode = readNumber(event.payload, "status_code");
+    const retryAfter = readNumber(event.payload, "retry_after_seconds");
+    const retryable = readBoolean(event.payload, "retryable");
+    return (
+      <div className="event-details">
+        <DetailGroup label="失败类型" values={category ? [category] : []} />
+        <DetailGroup
+          label="恢复信息"
+          values={[
+            ...(statusCode === undefined ? [] : [`HTTP ${statusCode}`]),
+            ...(retryable === undefined ? [] : [retryable ? "可重试" : "不可重试"]),
+            ...(retryAfter === undefined ? [] : [`建议等待 ${retryAfter} 秒`]),
+          ]}
+        />
+      </div>
+    );
+  }
+  if (
+    event.type === "tool.completed" &&
+    readString(event.payload, "tool_name") === "retrieve_indexed_paper"
+  ) {
+    return (
+      <div className="event-details">
+        <DetailGroup label="RAG 流程" values={[
+          `向量初始召回：${readNumber(event.payload, "initial_hit_count") ?? 0}`,
+          `树结构扩展候选：${readNumber(event.payload, "expanded_candidate_count") ?? 0}`,
+          `混合 rerank 最终证据：${readNumber(event.payload, "hit_count") ?? 0}`,
+        ]} />
+      </div>
+    );
+  }
   if (event.type !== "decision.recorded") return null;
   const summary = readString(event.payload, "summary");
   const objective = readString(event.payload, "objective");
@@ -131,8 +189,9 @@ function EventDetails({ event }: { event: AgentEvent }) {
       <DetailGroup label={readString(event.payload, "source") === "model" ? "AI 的说明" : "规则说明"} values={summary ? [summary] : []} />
       <DetailGroup label="观察到" values={readStringArray(event.payload, "observations")} />
       <DetailGroup label="仍缺少" values={readStringArray(event.payload, "missing_information")} />
+      <DetailGroup label="证据缺口" values={readStringArray(event.payload, "missing_requirements")} />
+      <DetailGroup label="需要证据" values={readStringArray(event.payload, "evidence_requirements")} />
       <DetailGroup label="执行目标" values={objective ? [objective] : []} />
-      <DetailGroup label="完成标准" values={readStringArray(event.payload, "success_criteria")} />
       <DetailGroup label="检索词" values={query ? [query] : []} />
       <DetailGroup label="策略改写" values={adjustment} />
       <DetailGroup label="领域" values={domain ? [domain] : []} />

@@ -31,6 +31,7 @@ class AgentExecutionRecorder:
             MessageRole.ASSISTANT,
             text_from_message_content(message.content),
             {
+                "run_id": str(context.run_id),
                 "tool_calls": cast(JsonValue, message.tool_calls),
                 "duration_ms": duration_ms,
                 "usage": {
@@ -58,7 +59,11 @@ class AgentExecutionRecorder:
             context.conversation_id,
             MessageRole.TOOL,
             content,
-            {"tool_call_id": call_id, "tool_name": tool_name},
+            {
+                "run_id": str(context.run_id),
+                "tool_call_id": call_id,
+                "tool_name": tool_name,
+            },
         )
         await self._store.append_tool_call(
             run_id=context.run_id,

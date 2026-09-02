@@ -6,8 +6,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
-from app.api.dependencies import get_chat_service
+from app.api.dependencies import get_chat_service, get_paper_library
 from app.api.schemas import (
+    AgentRunResponse,
     ConversationMetricsResponse,
     ConversationResponse,
     CreateConversationRequest,
@@ -16,6 +17,7 @@ from app.api.schemas import (
     SendMessageRequest,
 )
 from app.application.chat_service import ChatService, ConversationNotFoundError
+from app.application.paper_library import PaperLibraryService
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -35,6 +37,20 @@ async def list_conversations(
 ) -> list[ConversationResponse]:
     conversations = await service.list_conversations()
     return [ConversationResponse.from_domain(item) for item in conversations]
+
+
+@router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_conversation(
+    conversation_id: UUID,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+) -> None:
+    try:
+        await service.delete_conversation(conversation_id)
+    except ConversationNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        ) from error
 
 
 @router.get("/{conversation_id}/messages", response_model=list[MessageResponse])
@@ -67,6 +83,21 @@ async def get_conversation_metrics(
     return ConversationMetricsResponse.from_domain(metrics)
 
 
+@router.get("/{conversation_id}/runs", response_model=list[AgentRunResponse])
+async def list_runs(
+    conversation_id: UUID,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+) -> list[AgentRunResponse]:
+    try:
+        runs = await service.get_runs(conversation_id)
+    except ConversationNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        ) from error
+    return [AgentRunResponse.from_domain(run) for run in runs]
+
+
 @router.get("/{conversation_id}/events", response_model=list[EventResponse])
 async def list_events(
     conversation_id: UUID,
@@ -83,15 +114,53 @@ async def list_events(
     return [EventResponse.from_domain(event) for event in events]
 
 
+@router.post(
+    "/{conversation_id}/runs/{run_id}/cancel",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def cancel_run(
+    conversation_id: UUID,
+    run_id: UUID,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+) -> None:
+    try:
+        cancelled = await service.cancel_run(conversation_id, run_id)
+    except ConversationNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        ) from error
+    if not cancelled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Run is not active",
+        )
+
+
 @router.post("/{conversation_id}/messages/stream")
 async def stream_message(
     conversation_id: UUID,
     request: SendMessageRequest,
     service: Annotated[ChatService, Depends(get_chat_service)],
+    paper_library: Annotated[PaperLibraryService, Depends(get_paper_library)],
 ) -> StreamingResponse:
+    known_paper_ids = {paper.paper_id for paper in await paper_library.list_papers()}
+    missing_paper_ids = [
+        paper_id for paper_id in request.paper_ids if paper_id not in known_paper_ids
+    ]
+    if missing_paper_ids:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Indexed papers not found: {', '.join(missing_paper_ids)}",
+        )
+
     async def event_stream() -> AsyncIterator[str]:
         try:
-            async for event in service.stream_message(conversation_id, request.content):
+            async for event in service.stream_message(
+                conversation_id,
+                request.content,
+                request.paper_ids,
+            ):
                 response = EventResponse.from_domain(event)
                 data = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
                 yield f"id: {event.sequence}\nevent: {event.type.value}\ndata: {data}\n\n"

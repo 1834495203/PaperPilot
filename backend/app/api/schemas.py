@@ -3,8 +3,21 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.domain.entities import AgentEvent, Conversation, ConversationMetrics, Message
+from app.domain.entities import (
+    AgentEvent,
+    AgentRun,
+    Conversation,
+    ConversationMetrics,
+    Message,
+)
 from app.domain.enums import MessageRole
+from app.domain.rag import (
+    IndexedPaper,
+    IndexedPaperDetail,
+    RetrievalHit,
+    RetrievalMode,
+    TreeRetrievalReport,
+)
 from app.domain.types import JsonValue
 
 
@@ -18,6 +31,115 @@ class SendMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     content: str = Field(min_length=1, max_length=10_000)
+    paper_ids: list[str] = Field(default_factory=list, max_length=20)
+
+
+class IndexedPaperResponse(BaseModel):
+    paper_id: str
+    title: str
+    authors: list[str]
+    abstract: str | None
+    keywords: list[str]
+    doi: str | None
+    arxiv_id: str | None
+    original_filename: str
+    page_count: int
+    section_count: int
+    node_count: int
+    chunk_count: int
+    created_at: datetime
+
+    @classmethod
+    def from_domain(cls, paper: IndexedPaper) -> "IndexedPaperResponse":
+        return cls(
+            paper_id=paper.paper_id,
+            title=paper.metadata.title,
+            authors=paper.metadata.authors,
+            abstract=paper.metadata.abstract,
+            keywords=paper.metadata.keywords,
+            doi=paper.metadata.doi,
+            arxiv_id=paper.metadata.arxiv_id,
+            original_filename=paper.original_filename,
+            page_count=paper.page_count,
+            section_count=paper.section_count,
+            node_count=paper.node_count,
+            chunk_count=paper.chunk_count,
+            created_at=paper.created_at,
+        )
+
+
+class PaperTreeNodeResponse(BaseModel):
+    node_id: str
+    node_type: str
+    title: str
+    parent_id: str | None
+    children_ids: list[str]
+    level: int
+    section_path: list[str]
+    page_start: int | None
+    page_end: int | None
+    text_preview: str
+
+
+class IndexedPaperDetailResponse(BaseModel):
+    paper: IndexedPaperResponse
+    nodes: list[PaperTreeNodeResponse]
+
+    @classmethod
+    def from_domain(cls, detail: IndexedPaperDetail) -> "IndexedPaperDetailResponse":
+        return cls(
+            paper=IndexedPaperResponse.from_domain(detail.paper),
+            nodes=[
+                PaperTreeNodeResponse(**node.model_dump(mode="json"))
+                for node in detail.nodes
+            ],
+        )
+
+
+class RetrievePaperRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1, max_length=2_000)
+    paper_ids: list[str] = Field(min_length=1, max_length=20)
+    mode: RetrievalMode = RetrievalMode.FACT
+
+
+class RetrievalHitResponse(BaseModel):
+    rank: int
+    node_id: str
+    paper_id: str
+    section_path: list[str]
+    page_start: int | None
+    page_end: int | None
+    text: str
+    vector_score: float
+    ranking_score: float
+    source: str
+    expanded_from: str | None
+
+    @classmethod
+    def from_domain(cls, hit: RetrievalHit) -> "RetrievalHitResponse":
+        return cls(**hit.model_dump(mode="json"))
+
+
+class TreeRetrievalResponse(BaseModel):
+    query: str
+    mode: RetrievalMode
+    paper_ids: list[str]
+    initial_hit_count: int
+    expanded_candidate_count: int
+    hits: list[RetrievalHitResponse]
+
+    @classmethod
+    def from_domain(cls, report: TreeRetrievalReport) -> "TreeRetrievalResponse":
+        return cls(
+            query=report.query,
+            mode=report.mode,
+            paper_ids=report.paper_ids,
+            initial_hit_count=report.initial_hit_count,
+            expanded_candidate_count=report.expanded_candidate_count,
+            hits=[RetrievalHitResponse.from_domain(hit) for hit in report.hits],
+        )
 
 
 class ConversationResponse(BaseModel):
@@ -81,6 +203,38 @@ class ConversationMetricsResponse(BaseModel):
             total_duration_ms=metrics.total_duration_ms,
             run_count=metrics.run_count,
             updated_at=metrics.updated_at,
+        )
+
+
+class AgentRunResponse(BaseModel):
+    id: UUID
+    conversation_id: UUID
+    status: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    llm_calls: int
+    tool_calls: int
+    duration_ms: int
+    error: str | None
+    started_at: datetime
+    completed_at: datetime | None
+
+    @classmethod
+    def from_domain(cls, run: AgentRun) -> "AgentRunResponse":
+        return cls(
+            id=run.id,
+            conversation_id=run.conversation_id,
+            status=run.status.value,
+            input_tokens=run.metrics.input_tokens,
+            output_tokens=run.metrics.output_tokens,
+            total_tokens=run.metrics.total_tokens,
+            llm_calls=run.metrics.llm_calls,
+            tool_calls=run.metrics.tool_calls,
+            duration_ms=run.metrics.duration_ms,
+            error=run.error,
+            started_at=run.started_at,
+            completed_at=run.completed_at,
         )
 
 

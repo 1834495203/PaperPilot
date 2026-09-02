@@ -8,9 +8,9 @@ from app.domain.enums import EventType, MessageRole
 from app.infrastructure.agent.recording import AgentExecutionRecorder
 from app.infrastructure.agent.supervisor.model_gateway import AgentModelGateway
 from app.infrastructure.agent.supervisor.models import (
-    AgentName,
     CompletedStep,
     DecisionSource,
+    WriterTask,
 )
 from app.infrastructure.agent.supervisor.prompts import WRITER_PROMPT
 from app.infrastructure.agent.supervisor.state import SupervisorState, SupervisorStateUpdate
@@ -39,8 +39,9 @@ class WriterAgentNode:
     ) -> SupervisorStateUpdate:
         context = runtime.context
         decision = state["decision"]
-        if decision is None or decision.next_agent is not AgentName.WRITER:
+        if decision is None or not isinstance(decision.task, WriterTask):
             raise ValueError("Writer Agent requires a writer decision")
+        task = decision.task
         await context.publisher.publish(
             EventType.STAGE_STARTED.value,
             {
@@ -48,16 +49,16 @@ class WriterAgentNode:
                 "actor": "writer",
                 "stage": "writer",
                 "summary": "Writer Agent 节点开始执行",
-                "objective": decision.objective,
+                "objective": task.objective,
             },
         )
-        selected = select_artifacts(state["artifacts"], decision.artifact_ids)
+        selected = select_artifacts(state["artifacts"], task.source_artifact_ids)
         prompt = (
             f"User request:\n{state['user_request']}\n\n"
             f"Conversation context:\n{state['conversation_context']}\n\n"
-            f"Writing objective:\n{decision.objective}\n\n"
+            f"Writing objective:\n{task.objective}\n\n"
             f"Available research artifacts:\n"
-            f"{render_artifacts(selected, max_content_chars=40_000)}"
+            f"{render_artifacts(selected)}"
         )
 
         async def publish_token(text: str) -> None:
@@ -102,8 +103,8 @@ class WriterAgentNode:
             "completed_steps": [
                 *state["completed_steps"],
                 CompletedStep(
-                    agent=AgentName.WRITER,
-                    objective=decision.objective,
+                    agent=task.agent,
+                    objective=task.objective,
                 ),
             ],
             **with_usage(state, result.usage),

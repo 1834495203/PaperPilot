@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.domain.entities import (
@@ -36,6 +36,17 @@ class SqlAlchemyConversationStore(ConversationStore):
     async def initialize(self) -> None:
         async with self._engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        async with self._session_factory() as session:
+            await session.execute(
+                update(AgentRunRow)
+                .where(AgentRunRow.status == RunStatus.RUNNING.value)
+                .values(
+                    status=RunStatus.CANCELLED.value,
+                    error="Backend restarted before the run completed",
+                    completed_at=utc_now(),
+                )
+            )
+            await session.commit()
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -61,6 +72,37 @@ class SqlAlchemyConversationStore(ConversationStore):
         async with self._session_factory() as session:
             row = await session.get(ConversationRow, str(conversation_id))
         return self._to_conversation(row) if row is not None else None
+
+    async def delete_conversation(self, conversation_id: UUID) -> bool:
+        conversation_key = str(conversation_id)
+        run_ids = select(AgentRunRow.id).where(
+            AgentRunRow.conversation_id == conversation_key
+        )
+        async with self._session_factory() as session:
+            await session.execute(delete(ToolCallRow).where(ToolCallRow.run_id.in_(run_ids)))
+            await session.execute(
+                delete(AgentEventRow).where(
+                    AgentEventRow.conversation_id == conversation_key
+                )
+            )
+            await session.execute(
+                delete(ConversationMetricsRow).where(
+                    ConversationMetricsRow.conversation_id == conversation_key
+                )
+            )
+            await session.execute(
+                delete(MessageRow).where(MessageRow.conversation_id == conversation_key)
+            )
+            await session.execute(
+                delete(AgentRunRow).where(AgentRunRow.conversation_id == conversation_key)
+            )
+            deleted_id = await session.scalar(
+                delete(ConversationRow)
+                .where(ConversationRow.id == conversation_key)
+                .returning(ConversationRow.id)
+            )
+            await session.commit()
+        return deleted_id is not None
 
     async def list_messages(self, conversation_id: UUID) -> Sequence[Message]:
         async with self._session_factory() as session:
@@ -138,6 +180,17 @@ class SqlAlchemyConversationStore(ConversationStore):
             await session.commit()
         return self._to_run(row)
 
+    async def list_runs(self, conversation_id: UUID) -> Sequence[AgentRun]:
+        async with self._session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(AgentRunRow)
+                    .where(AgentRunRow.conversation_id == str(conversation_id))
+                    .order_by(AgentRunRow.started_at.asc())
+                )
+            ).all()
+        return [self._to_run(row) for row in rows]
+
     async def finish_run(
         self,
         run_id: UUID,
@@ -187,7 +240,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     ).where(
                         AgentRunRow.conversation_id == str(conversation_id),
                         AgentRunRow.status.in_(
-                            [RunStatus.COMPLETED.value, RunStatus.FAILED.value]
+                            [
+                                RunStatus.COMPLETED.value,
+                                RunStatus.FAILED.value,
+                                RunStatus.CANCELLED.value,
+                            ]
                         ),
                     )
                 )

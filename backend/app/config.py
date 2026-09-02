@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -43,8 +44,38 @@ class Settings(BaseSettings):
 
     arxiv_api_url: str = "https://export.arxiv.org/api/query"
     arxiv_timeout_seconds: float = 20.0
+    arxiv_min_request_interval_seconds: float = Field(default=3.0, ge=0, le=60)
+    arxiv_max_retries: int = Field(default=1, ge=0, le=3)
+    arxiv_retry_backoff_seconds: float = Field(default=3.0, ge=0, le=60)
+    pdf_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    pdf_max_bytes: int = Field(default=20_000_000, ge=1_000_000, le=100_000_000)
+    pdf_max_pages: int = Field(default=80, ge=1, le=500)
+    reader_max_input_chars: int = Field(default=100_000, ge=10_000, le=500_000)
+    reader_max_retrieval_rounds: int = Field(default=2, ge=1, le=5)
+    search_max_iterations: int = Field(default=2, ge=1, le=3)
     max_tool_iterations: int = Field(default=3, ge=1, le=8)
     supervisor_max_steps: int = Field(default=8, ge=2, le=20)
+
+    embedding_api_key: SecretStr = Field(
+        default=SecretStr("ollama"),
+        validation_alias="EMBEDDING_API_KEY",
+    )
+    embedding_base_url: str | None = Field(
+        default="http://localhost:11434/v1",
+        validation_alias="EMBEDDING_BASE_URL",
+    )
+    embedding_model: str = "qwen3-embedding:latest"
+    embedding_dimensions: int | None = Field(default=None, ge=1)
+    vector_db_path: Path = Path("./data/chroma")
+    vector_collection: str = "paperpilot_tree_chunks"
+    paper_library_path: Path = Path("./data/papers")
+    upload_max_bytes: int = Field(default=30_000_000, ge=1_000_000, le=100_000_000)
+    tree_chunk_max_chars: int = Field(default=1_800, ge=200, le=20_000)
+    retrieval_initial_top_k: int = Field(default=12, ge=1, le=100)
+    retrieval_final_top_k: int = Field(default=8, ge=1, le=50)
+    retrieval_max_expanded_per_hit: int = Field(default=8, ge=1, le=100)
+    retrieval_max_candidates: int = Field(default=40, ge=1, le=500)
+    retrieval_max_chunks_per_paper: int = Field(default=8, ge=1, le=100)
 
 
 @lru_cache(maxsize=1)

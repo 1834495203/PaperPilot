@@ -26,3 +26,14 @@ class Paper(BaseModel):
     abstract_url: HttpUrl
     pdf_url: HttpUrl | None
 
+
+class PdfDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_url: HttpUrl
+    page_count: int = Field(ge=0)
+    extracted_pages: int = Field(ge=0)
+    extracted_characters: int = Field(ge=0)
+    text: str
+    truncated: bool = False
+    extraction_warnings: list[str] = Field(default_factory=list)

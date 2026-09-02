@@ -7,6 +7,7 @@ from uuid import UUID
 from app.application.agent import AgentRunContext, AgentRunner
 from app.domain.entities import (
     AgentEvent,
+    AgentRun,
     Conversation,
     ConversationMetrics,
     Message,
@@ -25,12 +26,18 @@ class ChatService:
     def __init__(self, store: ConversationStore, agent: AgentRunner) -> None:
         self._store = store
         self._agent = agent
+        self._active_runs: dict[UUID, tuple[UUID, asyncio.Task[None]]] = {}
 
     async def create_conversation(self, title: str) -> Conversation:
         return await self._store.create_conversation(title)
 
     async def list_conversations(self) -> Sequence[Conversation]:
         return await self._store.list_conversations()
+
+    async def delete_conversation(self, conversation_id: UUID) -> None:
+        deleted = await self._store.delete_conversation(conversation_id)
+        if not deleted:
+            raise ConversationNotFoundError(str(conversation_id))
 
     async def get_messages(self, conversation_id: UUID) -> Sequence[Message]:
         await self._require_conversation(conversation_id)
@@ -43,6 +50,10 @@ class ChatService:
         await self._require_conversation(conversation_id)
         return await self._store.get_conversation_metrics(conversation_id)
 
+    async def get_runs(self, conversation_id: UUID) -> Sequence[AgentRun]:
+        await self._require_conversation(conversation_id)
+        return await self._store.list_runs(conversation_id)
+
     async def get_events(
         self,
         conversation_id: UUID,
@@ -51,14 +62,36 @@ class ChatService:
         await self._require_conversation(conversation_id)
         return await self._store.list_events(conversation_id, limit)
 
+    async def cancel_run(self, conversation_id: UUID, run_id: UUID) -> bool:
+        await self._require_conversation(conversation_id)
+        active = self._active_runs.get(run_id)
+        if active is None or active[0] != conversation_id:
+            return False
+        task = active[1]
+        if task.done():
+            return False
+        task.cancel()
+        await task
+        return True
+
     async def stream_message(
         self,
         conversation_id: UUID,
         content: str,
+        paper_ids: Sequence[str] = (),
     ) -> AsyncIterator[AgentEvent]:
         await self._require_conversation(conversation_id)
-        await self._store.append_message(conversation_id, MessageRole.USER, content)
+        selected_paper_ids = tuple(dict.fromkeys(paper_ids))
         run = await self._store.create_run(conversation_id)
+        await self._store.append_message(
+            conversation_id,
+            MessageRole.USER,
+            content,
+            metadata={
+                "run_id": str(run.id),
+                "paper_ids": list(selected_paper_ids),
+            },
+        )
         queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
         publisher = RunEventPublisher(
             run_id=run.id,
@@ -71,30 +104,28 @@ class ChatService:
                 conversation_id=conversation_id,
                 run_id=run.id,
                 publisher=publisher,
+                paper_ids=selected_paper_ids,
             ),
             name=f"paperpilot-run-{run.id}",
         )
+        self._active_runs[run.id] = (conversation_id, task)
 
         try:
             while True:
                 event = await queue.get()
                 yield event
-                if event.type in {EventType.RUN_COMPLETED, EventType.RUN_FAILED}:
+                if event.type in {
+                    EventType.RUN_COMPLETED,
+                    EventType.RUN_FAILED,
+                    EventType.RUN_CANCELLED,
+                }:
                     break
             await task
         finally:
             if not task.done():
                 task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    metrics = RunMetrics()
-                    await self._store.finish_run(
-                        run.id,
-                        RunStatus.FAILED,
-                        metrics,
-                        "Client disconnected before the run completed",
-                    )
+                await task
+            self._active_runs.pop(run.id, None)
 
     async def _execute_run(
         self,
@@ -102,6 +133,7 @@ class ChatService:
         conversation_id: UUID,
         run_id: UUID,
         publisher: RunEventPublisher,
+        paper_ids: tuple[str, ...],
     ) -> None:
         started = perf_counter()
         metrics_accumulated = False
@@ -117,6 +149,7 @@ class ChatService:
                     conversation_id=conversation_id,
                     run_id=run_id,
                     publisher=publisher,
+                    paper_ids=paper_ids,
                 ),
             )
             metrics = replace(metrics, duration_ms=int((perf_counter() - started) * 1000))
@@ -135,6 +168,33 @@ class ChatService:
                     "total_tokens": metrics.total_tokens,
                     "llm_calls": metrics.llm_calls,
                     "tool_calls": metrics.tool_calls,
+                    "conversation_input_tokens": conversation_metrics.input_tokens,
+                    "conversation_output_tokens": conversation_metrics.output_tokens,
+                    "conversation_total_tokens": conversation_metrics.total_tokens,
+                    "conversation_llm_calls": conversation_metrics.llm_calls,
+                    "conversation_tool_calls": conversation_metrics.tool_calls,
+                    "conversation_total_duration_ms": conversation_metrics.total_duration_ms,
+                    "conversation_run_count": conversation_metrics.run_count,
+                },
+            )
+        except asyncio.CancelledError:
+            metrics = RunMetrics(duration_ms=int((perf_counter() - started) * 1000))
+            message = "Run cancelled by the user or because the client disconnected"
+            await self._store.finish_run(
+                run_id,
+                RunStatus.CANCELLED,
+                metrics,
+                message,
+            )
+            conversation_metrics = await self._store.refresh_conversation_metrics(
+                conversation_id
+            )
+            await publisher.publish(
+                EventType.RUN_CANCELLED.value,
+                {
+                    "run_id": str(run_id),
+                    "duration_ms": metrics.duration_ms,
+                    "summary": "任务已停止",
                     "conversation_input_tokens": conversation_metrics.input_tokens,
                     "conversation_output_tokens": conversation_metrics.output_tokens,
                     "conversation_total_tokens": conversation_metrics.total_tokens,

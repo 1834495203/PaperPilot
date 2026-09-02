@@ -10,14 +10,20 @@ from app.domain.types import JsonValue
 from app.infrastructure.agent.supervisor.model_gateway import AgentModelGateway, ModelUsage
 from app.infrastructure.agent.supervisor.models import (
     AgentName,
+    AnalystTask,
+    ArtifactKind,
+    DecisionAssessment,
     DecisionSource,
+    ReaderTask,
+    SearchTask,
     SupervisorDecision,
+    WriterTask,
 )
 from app.infrastructure.agent.supervisor.prompts import SUPERVISOR_PROMPT
 from app.infrastructure.agent.supervisor.state import SupervisorState, SupervisorStateUpdate
 from app.infrastructure.agent.supervisor.support import (
     publish_metrics,
-    render_artifacts,
+    render_supervisor_context,
     with_usage,
 )
 
@@ -53,18 +59,21 @@ class SupervisorNode:
                 "source": DecisionSource.WORKFLOW.value,
                 "actor": "supervisor",
                 "stage": "supervisor",
-                "summary": "Supervisor 节点开始评估当前状态",
+                "summary": "Supervisor 节点开始评估 Agent 摘要和当前目标",
                 "step": state["step_count"] + 1,
             },
         )
         if state["step_count"] >= self._max_steps:
             decision = SupervisorDecision(
-                next_agent=AgentName.WRITER,
-                observations=[],
-                missing_information=[],
-                objective="基于当前已有产物生成最终回答，并明确说明尚未解决的限制",
-                decision_summary="调度步数已达到系统预算上限",
-                success_criteria=["生成最终回答", "明确披露当前证据限制"],
+                assessment=DecisionAssessment(
+                    observations=[],
+                    missing_information=["工作流已达到调度预算上限"],
+                    decision_summary="调度步数已达到系统预算上限",
+                ),
+                task=WriterTask(
+                    objective="基于当前已有产物生成最终回答，并明确说明尚未解决的限制",
+                    source_artifact_ids=[artifact.id for artifact in state["artifacts"]],
+                ),
             )
             await self._publish_policy_decision(
                 context,
@@ -82,15 +91,22 @@ class SupervisorNode:
         prompt = (
             f"User request:\n{state['user_request']}\n\n"
             f"Conversation context:\n{state['conversation_context']}\n\n"
+            f"Locally indexed paper IDs selected for this request:\n"
+            f"{list(context.paper_ids)}\n\n"
             f"Completed steps:\n{completed}\n\n"
-            f"Available artifacts:\n{render_artifacts(state['artifacts'], max_content_chars=8000)}"
+            "Agent-authored supervisor summaries (detailed reports are available to downstream "
+            f"agents by ID):\n{render_supervisor_context(state['artifacts'])}"
         )
         result = await self._model.generate_structured(
             [SystemMessage(content=SUPERVISOR_PROMPT), HumanMessage(content=prompt)],
             SupervisorDecision,
         )
         await self._publish_model_decision(context, result.value)
-        resolution = self._normalize_decision(state, result.value)
+        resolution = self._normalize_decision(
+            state,
+            result.value,
+            local_paper_ids=set(context.paper_ids),
+        )
         for adjustment in resolution.adjustments:
             await self._publish_policy_decision(context, resolution.decision, adjustment)
         update = self._state_update(state, resolution.decision, result.usage)
@@ -102,23 +118,21 @@ class SupervisorNode:
         context: AgentRunContext,
         decision: SupervisorDecision,
     ) -> None:
-        await context.publisher.publish(
-            EventType.DECISION_RECORDED.value,
-            {
-                "source": DecisionSource.MODEL.value,
-                "actor": "supervisor",
-                "status": "proposed",
-                "stage": "supervisor",
-                "summary": decision.decision_summary,
-                "next_agent": decision.next_agent.value,
-                "objective": decision.objective,
-                "observations": cast(JsonValue, decision.observations),
-                "missing_information": cast(JsonValue, decision.missing_information),
-                "success_criteria": cast(JsonValue, decision.success_criteria),
-                "query": decision.query,
-                "artifact_ids": [str(item) for item in decision.artifact_ids],
-            },
-        )
+        assessment = decision.assessment
+        task = decision.task
+        payload: dict[str, JsonValue] = {
+            "source": DecisionSource.MODEL.value,
+            "actor": "supervisor",
+            "status": "proposed",
+            "stage": "supervisor",
+            "summary": assessment.decision_summary,
+            "next_agent": task.agent.value,
+            "objective": task.objective,
+            "observations": cast(JsonValue, assessment.observations),
+            "missing_information": cast(JsonValue, assessment.missing_information),
+            **SupervisorNode._task_event_payload(task),
+        }
+        await context.publisher.publish(EventType.DECISION_RECORDED.value, payload)
 
     @staticmethod
     async def _publish_policy_decision(
@@ -137,8 +151,8 @@ class SupervisorNode:
                 "policy_rule": adjustment.rule,
                 "original_value": adjustment.original_value,
                 "effective_value": adjustment.effective_value,
-                "next_agent": decision.next_agent.value,
-                "objective": decision.objective,
+                "next_agent": decision.task.agent.value,
+                "objective": decision.task.objective,
             },
         )
 
@@ -160,48 +174,123 @@ class SupervisorNode:
     def _normalize_decision(
         state: SupervisorState,
         original: SupervisorDecision,
+        *,
+        local_paper_ids: set[str] | None = None,
     ) -> DecisionResolution:
         decision = original
+        task = decision.task
+        assessment = decision.assessment
         adjustments: list[PolicyAdjustment] = []
         valid_ids = {artifact.id for artifact in state["artifacts"]}
-        valid_artifact_ids = [
-            artifact_id for artifact_id in decision.artifact_ids if artifact_id in valid_ids
-        ]
-        if valid_artifact_ids != decision.artifact_ids:
-            adjustments.append(
-                PolicyAdjustment(
-                    rule="known_artifact_ids_only",
-                    summary="移除了当前状态中不存在的 Artifact 引用",
-                    original_value=[str(item) for item in decision.artifact_ids],
-                    effective_value=[str(item) for item in valid_artifact_ids],
+        valid_search_ids = {
+            artifact.id
+            for artifact in state["artifacts"]
+            if artifact.kind is ArtifactKind.SEARCH_RESULT
+        }
+        available_local_ids = local_paper_ids or set()
+
+        if isinstance(task, SearchTask):
+            valid_prior_ids = [
+                artifact_id
+                for artifact_id in task.prior_search_artifact_ids
+                if artifact_id in valid_search_ids
+            ]
+            if valid_prior_ids != task.prior_search_artifact_ids:
+                adjustments.append(
+                    PolicyAdjustment(
+                        rule="known_search_artifact_ids_only",
+                        summary="移除了不存在的历史 Search Artifact 引用",
+                        original_value=[str(item) for item in task.prior_search_artifact_ids],
+                        effective_value=[str(item) for item in valid_prior_ids],
+                    )
                 )
-            )
-            decision = decision.model_copy(update={"artifact_ids": valid_artifact_ids})
-        if decision.next_agent is AgentName.SEARCH and not decision.query:
-            adjustments.append(
-                PolicyAdjustment(
-                    rule="search_query_required",
-                    summary="Search 决策缺少 query，工作流使用 objective 作为检索提示",
-                    original_value=None,
-                    effective_value=decision.objective,
+                task = task.model_copy(update={"prior_search_artifact_ids": valid_prior_ids})
+        elif isinstance(task, ReaderTask):
+            if task.paper_id in available_local_ids:
+                if task.source_artifact_id is not None:
+                    adjustments.append(
+                        PolicyAdjustment(
+                            rule="local_reader_does_not_require_search_source",
+                            summary="本地已建库论文不需要 Search Artifact，已移除该引用",
+                            original_value=str(task.source_artifact_id),
+                            effective_value=None,
+                        )
+                    )
+                    task = task.model_copy(update={"source_artifact_id": None})
+            elif task.source_artifact_id not in valid_search_ids:
+                adjustments.append(
+                    PolicyAdjustment(
+                        rule="reader_requires_search_source",
+                        summary="Reader 必须引用有效的 Search Artifact，工作流改为补充检索",
+                        original_value=str(task.source_artifact_id),
+                        effective_value=AgentName.SEARCH.value,
+                    )
                 )
-            )
-            decision = decision.model_copy(update={"query": decision.objective})
-        if decision.next_agent is AgentName.ANALYST and not state["artifacts"]:
-            adjustments.append(
-                PolicyAdjustment(
-                    rule="analyst_requires_artifacts",
-                    summary="Analyst 没有输入 Artifact，工作流将下一步改为 Search",
-                    original_value=AgentName.ANALYST.value,
-                    effective_value=AgentName.SEARCH.value,
+                task = SupervisorNode._recovery_search_task(state)
+        elif isinstance(task, (AnalystTask, WriterTask)):
+            valid_source_ids = [
+                artifact_id for artifact_id in task.source_artifact_ids if artifact_id in valid_ids
+            ]
+            if valid_source_ids != task.source_artifact_ids:
+                adjustments.append(
+                    PolicyAdjustment(
+                        rule="known_source_artifact_ids_only",
+                        summary="移除了不存在的下游 Artifact 引用",
+                        original_value=[str(item) for item in task.source_artifact_ids],
+                        effective_value=[str(item) for item in valid_source_ids],
+                    )
                 )
-            )
-            decision = decision.model_copy(
-                update={
-                    "next_agent": AgentName.SEARCH,
-                    "objective": "先检索与用户目标相关的论文证据",
-                    "query": decision.query or state["user_request"][:300],
-                    "artifact_ids": [],
-                }
-            )
+                task = task.model_copy(update={"source_artifact_ids": valid_source_ids})
+            if isinstance(task, AnalystTask) and not valid_source_ids:
+                adjustments.append(
+                    PolicyAdjustment(
+                        rule="analyst_requires_sources",
+                        summary="Analyst 没有有效来源，工作流改为补充检索",
+                        original_value=AgentName.ANALYST.value,
+                        effective_value=AgentName.SEARCH.value,
+                    )
+                )
+                task = SupervisorNode._recovery_search_task(state)
+
+        decision = decision.model_copy(update={"assessment": assessment, "task": task})
         return DecisionResolution(decision=decision, adjustments=adjustments)
+
+    @staticmethod
+    def _recovery_search_task(state: SupervisorState) -> SearchTask:
+        return SearchTask(
+            objective="根据 Agent 摘要中尚未满足的条件补充直接相关论文证据",
+            query=state["user_request"],
+            prior_search_artifact_ids=[
+                artifact.id
+                for artifact in state["artifacts"]
+                if artifact.kind is ArtifactKind.SEARCH_RESULT
+            ],
+        )
+
+    @staticmethod
+    def _task_event_payload(
+        task: SearchTask | ReaderTask | AnalystTask | WriterTask,
+    ) -> dict[str, JsonValue]:
+        if isinstance(task, SearchTask):
+            return {
+                "query": task.query,
+                "artifact_ids": cast(
+                    JsonValue,
+                    [str(item) for item in task.prior_search_artifact_ids],
+                ),
+            }
+        if isinstance(task, ReaderTask):
+            return {
+                "artifact_ids": (
+                    [str(task.source_artifact_id)]
+                    if task.source_artifact_id is not None
+                    else []
+                ),
+                "paper_ids": [task.paper_id],
+            }
+        return {
+            "artifact_ids": cast(
+                JsonValue,
+                [str(item) for item in task.source_artifact_ids],
+            )
+        }

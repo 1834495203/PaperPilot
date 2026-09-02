@@ -1,4 +1,5 @@
 .env
+.idea/
 .venv/
 __pycache__/
 .pytest_cache/
@@ -12,3 +13,7 @@ __pycache__/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+/data/chroma/
+/backend/data/chroma/
+/backend/data/papers/
+/backend/paper/*.pdf

@@ -12,6 +12,7 @@ class RunStatus(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class EventType(StrEnum):
@@ -26,6 +27,7 @@ class EventType(StrEnum):
     METRICS_UPDATED = "metrics.updated"
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"
+    RUN_CANCELLED = "run.cancelled"
 
 
 PERSISTED_AGENT_EVENT_TYPES: frozenset[EventType] = frozenset(
@@ -39,5 +41,6 @@ PERSISTED_AGENT_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.METRICS_UPDATED,
         EventType.RUN_COMPLETED,
         EventType.RUN_FAILED,
+        EventType.RUN_CANCELLED,
     }
 )

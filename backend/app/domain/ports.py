@@ -11,7 +11,13 @@ from app.domain.entities import (
     RunMetrics,
 )
 from app.domain.enums import MessageRole, RunStatus
-from app.domain.papers import ArxivSearchInput, Paper
+from app.domain.papers import ArxivSearchInput, Paper, PdfDocument
+from app.domain.rag import (
+    IndexedTreeNode,
+    ParsedPaperDocument,
+    TreeIndexNode,
+    TreeVectorMatch,
+)
 from app.domain.types import JsonValue
 
 
@@ -24,6 +30,9 @@ class ConversationStore(ABC):
 
     @abstractmethod
     async def get_conversation(self, conversation_id: UUID) -> Conversation | None: ...
+
+    @abstractmethod
+    async def delete_conversation(self, conversation_id: UUID) -> bool: ...
 
     @abstractmethod
     async def list_messages(self, conversation_id: UUID) -> Sequence[Message]: ...
@@ -46,6 +55,9 @@ class ConversationStore(ABC):
 
     @abstractmethod
     async def create_run(self, conversation_id: UUID) -> AgentRun: ...
+
+    @abstractmethod
+    async def list_runs(self, conversation_id: UUID) -> Sequence[AgentRun]: ...
 
     @abstractmethod
     async def finish_run(
@@ -89,6 +101,60 @@ class ConversationStore(ABC):
 class PaperSearchGateway(ABC):
     @abstractmethod
     async def search(self, search_input: ArxivSearchInput) -> Sequence[Paper]: ...
+
+
+class PaperDocumentGateway(ABC):
+    @abstractmethod
+    async def fetch(self, url: str) -> PdfDocument: ...
+
+
+class ScientificPaperParser(ABC):
+    @abstractmethod
+    async def parse(
+        self,
+        path: str,
+        *,
+        paper_id: str,
+        title: str | None = None,
+    ) -> ParsedPaperDocument: ...
+
+
+class TextEmbeddingGateway(ABC):
+    @abstractmethod
+    async def embed_documents(self, texts: Sequence[str]) -> list[list[float]]: ...
+
+    @abstractmethod
+    async def embed_query(self, text: str) -> list[float]: ...
+
+
+class TreeVectorStore(ABC):
+    @property
+    @abstractmethod
+    def collection_name(self) -> str: ...
+
+    @abstractmethod
+    async def replace_paper(
+        self,
+        document: ParsedPaperDocument,
+        nodes: Sequence[TreeIndexNode],
+        embeddings: Sequence[Sequence[float]],
+    ) -> None: ...
+
+    @abstractmethod
+    async def similarity_search(
+        self,
+        query_embedding: Sequence[float],
+        *,
+        paper_ids: Sequence[str],
+        top_k: int,
+        chunks_only: bool,
+    ) -> list[TreeVectorMatch]: ...
+
+    @abstractmethod
+    async def load_paper_nodes(
+        self,
+        paper_ids: Sequence[str],
+    ) -> list[IndexedTreeNode]: ...
 
 
 class EventPublisher(ABC):

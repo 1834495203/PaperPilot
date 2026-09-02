@@ -24,6 +24,10 @@ class EventPersistencePolicy:
                 "tool_call_id",
                 "tool_name",
                 "result_count",
+                "initial_hit_count",
+                "expanded_candidate_count",
+                "hit_count",
+                "extracted_pages",
                 "duration_ms",
             }
         }

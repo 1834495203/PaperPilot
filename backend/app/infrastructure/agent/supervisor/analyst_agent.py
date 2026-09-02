@@ -11,7 +11,8 @@ from app.infrastructure.agent.supervisor.models import (
     AgentArtifact,
     AgentName,
     AnalysisReport,
-    ArtifactKind,
+    AnalystAgentSummary,
+    AnalystTask,
     CompletedStep,
     DecisionSource,
 )
@@ -36,8 +37,9 @@ class AnalystAgentNode:
     ) -> SupervisorStateUpdate:
         context = runtime.context
         decision = state["decision"]
-        if decision is None or decision.next_agent is not AgentName.ANALYST:
+        if decision is None or not isinstance(decision.task, AnalystTask):
             raise ValueError("Analyst Agent requires an analyst decision")
+        task = decision.task
         await context.publisher.publish(
             EventType.STAGE_STARTED.value,
             {
@@ -45,19 +47,18 @@ class AnalystAgentNode:
                 "actor": "analyst",
                 "stage": "analyst",
                 "summary": "Analyst Agent 节点开始执行",
-                "objective": decision.objective,
+                "objective": task.objective,
             },
         )
-        selected = select_artifacts(state["artifacts"], decision.artifact_ids)
+        selected = select_artifacts(state["artifacts"], task.source_artifact_ids)
         result = await self._model.generate_structured(
             [
                 SystemMessage(content=ANALYST_PROMPT),
                 HumanMessage(
                     content=(
-                        f"User request:\n{state['user_request']}\n\n"
-                        f"Analysis objective:\n{decision.objective}\n\n"
+                        f"Assigned analysis task:\n{task.objective}\n\n"
                         "Research artifacts:\n"
-                        f"{render_artifacts(selected, max_content_chars=36_000)}"
+                        f"{render_artifacts(selected)}"
                     )
                 ),
             ],
@@ -65,11 +66,14 @@ class AnalystAgentNode:
         )
         report = result.value
         artifact = AgentArtifact(
-            kind=ArtifactKind.ANALYSIS_REPORT,
             title=f"Analysis report: {report.analysis_type}",
-            summary=(
-                f"形成 {len(report.findings)} 条高层发现和 "
-                f"{len(report.research_gaps)} 个潜在研究空白"
+            supervisor_summary=AnalystAgentSummary(
+                summary=report.analysis_summary,
+                finding_count=len(report.findings),
+                research_gap_count=len(report.research_gaps),
+                novelty_assessment=report.novelty_assessment,
+                research_gaps=report.research_gaps,
+                unresolved_questions=report.unresolved_questions,
             ),
             content=report.model_dump_json(),
             source_artifact_ids=[item.id for item in selected],
@@ -95,7 +99,7 @@ class AnalystAgentNode:
                 *state["completed_steps"],
                 CompletedStep(
                     agent=AgentName.ANALYST,
-                    objective=decision.objective,
+                    objective=task.objective,
                     artifact_id=artifact.id,
                 ),
             ],
