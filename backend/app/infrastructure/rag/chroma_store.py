@@ -9,6 +9,7 @@ from typing import Any, cast
 from app.domain.ports import TreeVectorStore
 from app.domain.rag import (
     IndexedTreeNode,
+    PaperBlockType,
     ParsedPaperDocument,
     TreeIndexNode,
     TreeNodeType,
@@ -35,7 +36,7 @@ class ChromaTreeVectorStore(TreeVectorStore):
             metadata={
                 "description": "PaperPilot TreeRAG paper and chunk index",
                 "hnsw:space": "cosine",
-                "schema_version": 1,
+                "schema_version": 3,
             },
         )
         self._collection_name = collection_name
@@ -52,13 +53,18 @@ class ChromaTreeVectorStore(TreeVectorStore):
     ) -> None:
         await asyncio.to_thread(self._replace_paper_sync, document, nodes, embeddings)
 
+    async def delete_paper(self, paper_id: str) -> None:
+        await asyncio.to_thread(self._collection.delete, where={"paper_id": paper_id})
+
     async def similarity_search(
         self,
         query_embedding: Sequence[float],
         *,
-        paper_ids: Sequence[str],
+        paper_ids: Sequence[str] | None,
         top_k: int,
         chunks_only: bool,
+        node_types: Sequence[TreeNodeType] | None = None,
+        parent_ids: Sequence[str] | None = None,
     ) -> list[TreeVectorMatch]:
         return await asyncio.to_thread(
             self._similarity_search_sync,
@@ -66,11 +72,13 @@ class ChromaTreeVectorStore(TreeVectorStore):
             paper_ids,
             top_k,
             chunks_only,
+            node_types,
+            parent_ids,
         )
 
     async def load_paper_nodes(
         self,
-        paper_ids: Sequence[str],
+        paper_ids: Sequence[str] | None,
     ) -> list[IndexedTreeNode]:
         return await asyncio.to_thread(self._load_paper_nodes_sync, paper_ids)
 
@@ -114,21 +122,30 @@ class ChromaTreeVectorStore(TreeVectorStore):
     def _similarity_search_sync(
         self,
         query_embedding: Sequence[float],
-        paper_ids: Sequence[str],
+        paper_ids: Sequence[str] | None,
         top_k: int,
         chunks_only: bool,
+        node_types: Sequence[TreeNodeType] | None,
+        parent_ids: Sequence[str] | None,
     ) -> list[TreeVectorMatch]:
-        if not paper_ids or top_k < 1:
+        if top_k < 1:
             return []
-        where = self._where_filter(paper_ids, chunks_only=chunks_only)
+        where = self._where_filter(
+            paper_ids,
+            chunks_only=chunks_only,
+            node_types=node_types,
+            parent_ids=parent_ids,
+        )
+        query_kwargs: dict[str, Any] = {
+            "query_embeddings": [list(query_embedding)],
+            "n_results": top_k,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where is not None:
+            query_kwargs["where"] = where
         raw = cast(
             dict[str, Any],
-            self._collection.query(
-                query_embeddings=[list(query_embedding)],
-                n_results=top_k,
-                where=where,
-                include=["documents", "metadatas", "distances"],
-            ),
+            self._collection.query(**query_kwargs),
         )
         ids = raw.get("ids", [[]])[0]
         documents = raw.get("documents", [[]])[0]
@@ -154,16 +171,17 @@ class ChromaTreeVectorStore(TreeVectorStore):
 
     def _load_paper_nodes_sync(
         self,
-        paper_ids: Sequence[str],
+        paper_ids: Sequence[str] | None,
     ) -> list[IndexedTreeNode]:
-        if not paper_ids:
-            return []
+        get_kwargs: dict[str, Any] = {
+            "include": ["documents", "metadatas", "embeddings"]
+        }
+        where = self._where_filter(paper_ids, chunks_only=False)
+        if where is not None:
+            get_kwargs["where"] = where
         raw = cast(
             dict[str, Any],
-            self._collection.get(
-                where=self._where_filter(paper_ids, chunks_only=False),
-                include=["documents", "metadatas", "embeddings"],
-            ),
+            self._collection.get(**get_kwargs),
         )
         ids = raw.get("ids", [])
         documents = raw.get("documents", [])
@@ -191,18 +209,37 @@ class ChromaTreeVectorStore(TreeVectorStore):
 
     @staticmethod
     def _where_filter(
-        paper_ids: Sequence[str],
+        paper_ids: Sequence[str] | None,
         *,
         chunks_only: bool,
-    ) -> dict[str, Any]:
-        paper_filter: dict[str, Any] = (
-            {"paper_id": str(paper_ids[0])}
-            if len(paper_ids) == 1
-            else {"paper_id": {"$in": [str(item) for item in paper_ids]}}
-        )
-        if not chunks_only:
-            return paper_filter
-        return {"$and": [paper_filter, {"node_type": TreeNodeType.CHUNK.value}]}
+        node_types: Sequence[TreeNodeType] | None = None,
+        parent_ids: Sequence[str] | None = None,
+    ) -> dict[str, Any] | None:
+        clauses: list[dict[str, Any]] = []
+        if paper_ids:
+            clauses.append(
+                {"paper_id": str(paper_ids[0])}
+                if len(paper_ids) == 1
+                else {"paper_id": {"$in": [str(item) for item in paper_ids]}}
+            )
+        effective_types = [TreeNodeType.CHUNK] if chunks_only else list(node_types or [])
+        if effective_types:
+            clauses.append(
+                {"node_type": effective_types[0].value}
+                if len(effective_types) == 1
+                else {"node_type": {"$in": [item.value for item in effective_types]}}
+            )
+        if parent_ids:
+            clauses.append(
+                {"parent_id": str(parent_ids[0])}
+                if len(parent_ids) == 1
+                else {"parent_id": {"$in": [str(item) for item in parent_ids]}}
+            )
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
 
     @staticmethod
     def _node_from_record(
@@ -215,6 +252,8 @@ class ChromaTreeVectorStore(TreeVectorStore):
         page_end = int(metadata.get("page_end", 0)) or None
         section_path = json.loads(str(metadata.get("section_path", "[]")))
         children_ids = json.loads(str(metadata.get("children_ids", "[]")))
+        block_types = json.loads(str(metadata.get("block_types", "[]")))
+        object_labels = json.loads(str(metadata.get("object_labels", "[]")))
         prefix = str(metadata.get("embedding_prefix", ""))
         return TreeIndexNode(
             node_id=node_id,
@@ -225,6 +264,9 @@ class ChromaTreeVectorStore(TreeVectorStore):
             children_ids=[str(item) for item in children_ids],
             level=int(metadata.get("level", 0)),
             section_path=[str(item) for item in section_path],
+            semantic_role=str(metadata.get("semantic_role", "")) or None,
+            block_types=[PaperBlockType(str(item)) for item in block_types],
+            object_labels=[str(item) for item in object_labels],
             text=document,
             embedding_text="\n".join([prefix, document]).strip(),
             page_start=page_start,
@@ -238,7 +280,7 @@ class ChromaTreeVectorStore(TreeVectorStore):
     ) -> dict[str, str | int | bool]:
         prefix = "\n".join([document.title, *node.section_path])
         return {
-            "schema_version": 1,
+            "schema_version": 3,
             "paper_id": document.paper_id,
             "paper_title": document.title,
             "source_path": str(document.source_path),
@@ -247,6 +289,11 @@ class ChromaTreeVectorStore(TreeVectorStore):
             "children_ids": json.dumps(node.children_ids, ensure_ascii=False),
             "level": node.level,
             "section_path": json.dumps(node.section_path, ensure_ascii=False),
+            "semantic_role": node.semantic_role or "",
+            "block_types": json.dumps(
+                [item.value for item in node.block_types], ensure_ascii=False
+            ),
+            "object_labels": json.dumps(node.object_labels, ensure_ascii=False),
             "section_title": node.title,
             "page_start": node.page_start or 0,
             "page_end": node.page_end or 0,

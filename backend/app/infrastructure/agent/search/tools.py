@@ -3,13 +3,13 @@ import json
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.domain.papers import ArxivSearchInput
+from app.domain.papers import PaperSearchInput
 from app.domain.ports import PaperSearchGateway
 from app.domain.types import JsonValue
 from app.infrastructure.agent.tooling import AgentTool, AgentToolResult
 
 
-class ArxivSearchToolInput(BaseModel):
+class AcademicPaperSearchToolInput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     query: str = Field(min_length=2, max_length=300)
@@ -25,7 +25,7 @@ class ArxivSearchToolInput(BaseModel):
     )
 
 
-class ArxivSearchAgentTool(AgentTool):
+class AcademicPaperSearchAgentTool(AgentTool):
     """Search-agent adapter over the domain-level paper search gateway."""
 
     def __init__(self, gateway: PaperSearchGateway) -> None:
@@ -34,38 +34,51 @@ class ArxivSearchAgentTool(AgentTool):
             coroutine=self._search_for_model,
             name=self.name,
             description=(
-                "Search arXiv for real academic papers relevant to a focused research query."
+                "Search real academic papers using the fixed OpenAlex, Semantic Scholar, "
+                "then arXiv fallback chain. The provider is selected by policy, not by the model."
             ),
-            args_schema=ArxivSearchToolInput,
+            args_schema=AcademicPaperSearchToolInput,
         )
 
     @property
     def name(self) -> str:
-        return "search_arxiv"
+        return "search_academic_papers"
 
     def as_langchain_tool(self) -> BaseTool:
         return self._tool
 
     async def execute(self, arguments: dict[str, JsonValue]) -> AgentToolResult:
-        tool_input = ArxivSearchToolInput.model_validate(arguments)
-        search_input = ArxivSearchInput(
+        tool_input = AcademicPaperSearchToolInput.model_validate(arguments)
+        search_input = PaperSearchInput(
             query=tool_input.query,
             max_results=tool_input.max_results,
             sort_by=tool_input.sort_by,
         )
-        papers = await self._gateway.search(search_input)
-        serialized: list[JsonValue] = [
-            paper.model_dump(mode="json") for paper in papers
-        ]
+        search_result = await self._gateway.search(search_input)
+        papers = search_result.papers
+        serialized: list[JsonValue] = [paper.model_dump(mode="json") for paper in papers]
         return AgentToolResult(
             content=json.dumps(serialized, ensure_ascii=False),
             result=serialized,
             persisted_summary={
                 "result_count": len(papers),
-                "paper_ids": [paper.arxiv_id for paper in papers],
+                "provider": (
+                    search_result.provider.value if search_result.provider is not None else None
+                ),
+                "attempts": [attempt.model_dump(mode="json") for attempt in search_result.attempts],
+                "paper_ids": [paper.paper_id for paper in papers],
                 "titles": [paper.title for paper in papers],
             },
-            event_payload={"result_count": len(papers), "papers": serialized},
+            event_payload={
+                "result_count": len(papers),
+                "provider": (
+                    search_result.provider.value if search_result.provider is not None else None
+                ),
+                "provider_attempts": [
+                    attempt.model_dump(mode="json") for attempt in search_result.attempts
+                ],
+                "papers": serialized,
+            },
         )
 
     async def _search_for_model(
@@ -84,5 +97,5 @@ class ArxivSearchAgentTool(AgentTool):
             }
         )
         if not isinstance(result.result, list):
-            raise TypeError("arXiv search result must be a list")
+            raise TypeError("Academic paper search result must be a list")
         return result.result

@@ -14,7 +14,10 @@ from app.domain.enums import EventType
 from app.domain.papers import Paper
 from app.domain.types import JsonValue
 from app.infrastructure.agent.recording import AgentExecutionRecorder
-from app.infrastructure.agent.search.tools import ArxivSearchAgentTool, ArxivSearchToolInput
+from app.infrastructure.agent.search.tools import (
+    AcademicPaperSearchAgentTool,
+    AcademicPaperSearchToolInput,
+)
 from app.infrastructure.agent.supervisor.model_gateway import AgentModelGateway, ModelUsage
 from app.infrastructure.agent.supervisor.models import (
     AgentArtifact,
@@ -51,7 +54,7 @@ class SearchAgentNode:
         self,
         *,
         model: AgentModelGateway,
-        tool: ArxivSearchAgentTool,
+        tool: AcademicPaperSearchAgentTool,
         recorder: AgentExecutionRecorder,
         max_iterations: int = 2,
     ) -> None:
@@ -113,7 +116,7 @@ class SearchAgentNode:
             llm_calls += 1
             if tool_call.tool_name != self._tool.name:
                 raise ValueError(f"Search Agent selected unsupported tool: {tool_call.tool_name}")
-            validated_call = ArxivSearchToolInput.model_validate(tool_call.arguments)
+            validated_call = AcademicPaperSearchToolInput.model_validate(tool_call.arguments)
             arguments = cast(dict[str, JsonValue], validated_call.model_dump(mode="json"))
             query_text = validated_call.query
             if query_text in attempted_queries:
@@ -141,7 +144,7 @@ class SearchAgentNode:
                 break
             successful_searches += 1
             for paper in execution.papers:
-                papers_by_id[paper.arxiv_id] = paper
+                papers_by_id[paper.paper_id] = paper
             if not papers_by_id:
                 screening_feedback = "No papers were returned."
                 required_query = None
@@ -166,7 +169,7 @@ class SearchAgentNode:
             screening = self._normalize_screening(screening_result.value, papers_by_id)
             screening_summaries.append(screening.screening_summary)
             assessments_by_id.update(
-                {assessment.arxiv_id: assessment for assessment in screening.assessments}
+                {assessment.paper_id: assessment for assessment in screening.assessments}
             )
             await context.publisher.publish(
                 EventType.DECISION_RECORDED.value,
@@ -227,7 +230,7 @@ class SearchAgentNode:
             ),
         )
         artifact = AgentArtifact(
-            title=f"Screened arXiv search: {task.objective}",
+            title=f"Screened academic search: {task.objective}",
             supervisor_summary=SearchAgentSummary(
                 summary=(
                     f"检索状态：{status.value}。执行 {len(attempted_queries)} 个查询；"
@@ -243,14 +246,15 @@ class SearchAgentNode:
                 irrelevant_count=irrelevant_count,
                 papers=[
                     SearchPaperSummary(
-                        arxiv_id=item.arxiv_id,
-                        title=papers_by_id[item.arxiv_id].title,
+                        paper_id=item.paper_id,
+                        source=papers_by_id[item.paper_id].source,
+                        title=papers_by_id[item.paper_id].title,
                         relevance=item.relevance,
                         relevance_reason=item.relevance_reason,
                         matched_topics=item.matched_topics,
                     )
                     for item in assessments
-                    if item.arxiv_id in papers_by_id
+                    if item.paper_id in papers_by_id
                 ],
             ),
             content=report.model_dump_json(),
@@ -282,7 +286,7 @@ class SearchAgentNode:
         *,
         context: AgentRunContext,
         call_id: str,
-        validated_call: ArxivSearchToolInput,
+        validated_call: AcademicPaperSearchToolInput,
         arguments: dict[str, JsonValue],
     ) -> SearchExecution:
         await context.publisher.publish(
@@ -391,7 +395,7 @@ class SearchAgentNode:
     @staticmethod
     def _papers_from_result(result: JsonValue) -> list[Paper]:
         if not isinstance(result, list):
-            raise TypeError("arXiv tool result must be a list")
+            raise TypeError("Academic search tool result must be a list")
         return [Paper.model_validate(item) for item in result]
 
     @staticmethod
@@ -413,9 +417,9 @@ class SearchAgentNode:
             for query in report.attempted_queries:
                 if query not in attempted_queries:
                     attempted_queries.append(query)
-            papers_by_id.update({paper.arxiv_id: paper for paper in report.papers})
+            papers_by_id.update({paper.paper_id: paper for paper in report.papers})
             assessments_by_id.update(
-                {assessment.arxiv_id: assessment for assessment in report.assessments}
+                {assessment.paper_id: assessment for assessment in report.assessments}
             )
         return attempted_queries, papers_by_id, assessments_by_id
 
@@ -426,13 +430,11 @@ class SearchAgentNode:
     ) -> SearchScreening:
         known_ids = set(papers_by_id)
         normalized: dict[str, PaperAssessment] = {
-            item.arxiv_id: item
-            for item in screening.assessments
-            if item.arxiv_id in known_ids
+            item.paper_id: item for item in screening.assessments if item.paper_id in known_ids
         }
         for missing_id in known_ids - set(normalized):
             normalized[missing_id] = PaperAssessment(
-                arxiv_id=missing_id,
+                paper_id=missing_id,
                 relevance=PaperRelevance.IRRELEVANT,
                 relevance_reason="The screening response omitted this candidate",
                 matched_topics=[],
@@ -444,11 +446,7 @@ class SearchAgentNode:
         assessments: Iterable[PaperAssessment],
         relevance: PaperRelevance,
     ) -> int:
-        return sum(
-            1
-            for item in assessments
-            if item.relevance is relevance
-        )
+        return sum(1 for item in assessments if item.relevance is relevance)
 
     @staticmethod
     def _add_usage(left: ModelUsage, right: ModelUsage) -> ModelUsage:

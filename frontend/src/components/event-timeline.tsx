@@ -53,7 +53,8 @@ function isPaper(value: JsonValue): value is PaperResult {
     value !== null &&
     !Array.isArray(value) &&
     typeof value.title === "string" &&
-    typeof value.arxiv_id === "string" &&
+    typeof value.paper_id === "string" &&
+    typeof value.source === "string" &&
     Array.isArray(value.authors)
   );
 }
@@ -238,9 +239,9 @@ export function EventTimeline({ events }: EventTimelineProps) {
                 {papers.length > 0 ? (
                   <div className="paper-list">
                     {papers.map((paper) => (
-                      <a href={paper.abstract_url} target="_blank" rel="noreferrer" key={paper.arxiv_id}>
+                      <a href={paper.landing_page_url} target="_blank" rel="noreferrer" key={paper.paper_id}>
                         <strong>{paper.title}</strong>
-                        <span>{paper.authors.slice(0, 3).join(", ")}</span>
+                        <span>{paper.authors.slice(0, 3).join(", ")} · {paper.source}</span>
                       </a>
                     ))}
                   </div>

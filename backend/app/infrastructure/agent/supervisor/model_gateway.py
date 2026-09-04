@@ -89,10 +89,11 @@ class ChatModelGateway(AgentModelGateway):
         augmented[-1] = last.model_copy(
             update={"content": f"{text_from_message_content(last.content)}\n\n{schema_instruction}"}
         )
+        structured_model = self._model.bind(response_format={"type": "json_object"})
         total_usage = ModelUsage()
         last_error: ValueError | ValidationError | None = None
         for attempt in range(2):
-            response = await self._model.ainvoke(augmented)
+            response = await structured_model.ainvoke(augmented)
             if not isinstance(response, AIMessage):
                 raise TypeError("Chat model must return an AIMessage")
             usage = self._usage_from_message(response)
@@ -114,7 +115,11 @@ class ChatModelGateway(AgentModelGateway):
                             HumanMessage(
                                 content=(
                                     f"The previous response is invalid for {schema.__name__}. "
-                                    "Return one corrected JSON object only."
+                                    "Rebuild the entire object from scratch and return JSON only. "
+                                    "Ensure every required field is present and all strings are "
+                                    "escaped, "
+                                    "and every comma, bracket, and brace is valid.\n"
+                                    f"Validation errors:\n{self._validation_feedback(error)}"
                                 )
                             ),
                         ]
@@ -156,21 +161,70 @@ class ChatModelGateway(AgentModelGateway):
     ) -> ToolCallModelResult:
         if not tools:
             raise ValueError("Tool-call generation requires at least one tool")
-        response = await self._model.bind_tools(list(tools)).ainvoke(list(messages))
-        if not isinstance(response, AIMessage):
-            raise TypeError("Chat model must return an AIMessage")
+        available_tools = {tool.name: tool for tool in tools}
+        augmented = list(messages)
+        bound_model = self._model.bind_tools(list(tools))
+        total_usage = ModelUsage()
+        last_error: ValueError | ValidationError | TypeError | None = None
+        for attempt in range(2):
+            response = await bound_model.ainvoke(augmented)
+            if not isinstance(response, AIMessage):
+                raise TypeError("Chat model must return an AIMessage")
+            total_usage = self._add_usage(total_usage, self._usage_from_message(response))
+            try:
+                call_id, tool_name, arguments = self._validated_tool_call(
+                    response,
+                    available_tools,
+                )
+                return ToolCallModelResult(
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    usage=total_usage,
+                )
+            except (ValidationError, ValueError, TypeError) as error:
+                last_error = error
+                if attempt == 0:
+                    augmented.extend(
+                        [
+                            response,
+                            HumanMessage(
+                                content=(
+                                    "The previous tool call is invalid. Generate exactly one new "
+                                    "tool call from scratch and do not answer in plain text.\n"
+                                    f"Validation errors:\n{self._validation_feedback(error)}"
+                                )
+                            ),
+                        ]
+                    )
+        raise ValueError(f"Model returned an invalid tool call after one repair: {last_error}")
+
+    @staticmethod
+    def _validated_tool_call(
+        response: AIMessage,
+        available_tools: dict[str, BaseTool],
+    ) -> tuple[str, str, dict[str, object]]:
         if len(response.tool_calls) != 1:
-            raise ValueError("Search Agent must produce exactly one tool call")
+            invalid_details = ", ".join(
+                str(call.get("error") or "unparseable arguments")
+                for call in response.invalid_tool_calls
+            )
+            detail = f" Invalid calls: {invalid_details}." if invalid_details else ""
+            raise ValueError(
+                f"Expected exactly one tool call; got {len(response.tool_calls)}.{detail}"
+            )
         call = response.tool_calls[0]
+        tool_name = str(call["name"])
+        tool = available_tools.get(tool_name)
+        if tool is None:
+            expected = ", ".join(sorted(available_tools))
+            raise ValueError(f"Unsupported tool '{tool_name}'; expected one of: {expected}")
         raw_arguments = call["args"]
         if not isinstance(raw_arguments, dict):
-            raise TypeError("Tool-call arguments must be an object")
-        return ToolCallModelResult(
-            call_id=str(call["id"]),
-            tool_name=str(call["name"]),
-            arguments=cast(dict[str, object], raw_arguments),
-            usage=self._usage_from_message(response),
-        )
+            raise TypeError("Tool-call arguments must be a JSON object")
+        input_schema = cast(type[BaseModel], tool.get_input_schema())
+        arguments = input_schema.model_validate(raw_arguments).model_dump()
+        return str(call["id"]), tool_name, cast(dict[str, object], arguments)
 
     @staticmethod
     def _extract_json_object(content: str) -> str:
@@ -180,6 +234,25 @@ class ChatModelGateway(AgentModelGateway):
         if start < 0 or end < start:
             raise ValueError("Model response does not contain a JSON object")
         return stripped[start : end + 1]
+
+    @staticmethod
+    def _validation_feedback(
+        error: ValueError | ValidationError | TypeError,
+    ) -> str:
+        if isinstance(error, ValidationError):
+            return json.dumps(
+                error.errors(include_input=False, include_url=False),
+                ensure_ascii=False,
+            )
+        return str(error)
+
+    @staticmethod
+    def _add_usage(left: ModelUsage, right: ModelUsage) -> ModelUsage:
+        return ModelUsage(
+            input_tokens=left.input_tokens + right.input_tokens,
+            output_tokens=left.output_tokens + right.output_tokens,
+            total_tokens=left.total_tokens + right.total_tokens,
+        )
 
     @staticmethod
     def _usage_from_message(message: AIMessage) -> ModelUsage:

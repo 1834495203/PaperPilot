@@ -61,6 +61,12 @@ class _Retriever:
 
 
 class _VectorStore:
+    def __init__(self) -> None:
+        self.deleted_paper_ids: list[str] = []
+
+    async def delete_paper(self, paper_id: str) -> None:
+        self.deleted_paper_ids.append(paper_id)
+
     async def load_paper_nodes(self, paper_ids: list[str]) -> list[IndexedTreeNode]:
         paper_id = paper_ids[0]
         assert paper_id is not None
@@ -96,13 +102,22 @@ class _VectorStore:
         ]
 
 
-def _service(tmp_path: Path) -> PaperLibraryService:
+class _FailingDeleteVectorStore(_VectorStore):
+    async def delete_paper(self, paper_id: str) -> None:
+        raise RuntimeError("vector database unavailable")
+
+
+def _service(
+    tmp_path: Path,
+    *,
+    vector_store: _VectorStore | None = None,
+) -> PaperLibraryService:
     return PaperLibraryService(
         library_path=tmp_path / "papers",
         max_upload_bytes=1_000_000,
         ingestion=cast(Any, _Ingestion()),
         retriever=cast(Any, _Retriever()),
-        vector_store=cast(Any, _VectorStore()),
+        vector_store=cast(Any, vector_store or _VectorStore()),
     )
 
 
@@ -138,6 +153,43 @@ async def test_upload_rejects_non_pdf_content(tmp_path: Path) -> None:
 
     with pytest.raises(PaperUploadError, match="PDF signature"):
         await service.upload_pdf(filename="fake.pdf", content=b"not a pdf")
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_pdf_manifest_and_vector_nodes(tmp_path: Path) -> None:
+    vector_store = _VectorStore()
+    service = _service(tmp_path, vector_store=vector_store)
+    await service.initialize()
+    paper = await service.upload_pdf(
+        filename="delete-me.pdf",
+        content=b"%PDF-1.7\nminimal-test-content",
+    )
+
+    deleted = await service.delete_paper(paper.paper_id)
+
+    assert deleted.paper_id == paper.paper_id
+    assert vector_store.deleted_paper_ids == [paper.paper_id]
+    assert not (tmp_path / "papers" / f"{paper.paper_id}.pdf").exists()
+    assert not (tmp_path / "papers" / f"{paper.paper_id}.json").exists()
+    with pytest.raises(PaperNotFoundError):
+        await service.get_paper(paper.paper_id)
+
+
+@pytest.mark.asyncio
+async def test_delete_restores_files_when_vector_deletion_fails(tmp_path: Path) -> None:
+    service = _service(tmp_path, vector_store=_FailingDeleteVectorStore())
+    await service.initialize()
+    paper = await service.upload_pdf(
+        filename="keep-me.pdf",
+        content=b"%PDF-1.7\nminimal-test-content",
+    )
+
+    with pytest.raises(RuntimeError, match="vector database unavailable"):
+        await service.delete_paper(paper.paper_id)
+
+    assert (tmp_path / "papers" / f"{paper.paper_id}.pdf").exists()
+    assert (tmp_path / "papers" / f"{paper.paper_id}.json").exists()
+    assert (await service.get_paper(paper.paper_id)).paper_id == paper.paper_id
 
 
 @pytest.mark.asyncio

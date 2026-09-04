@@ -1,3 +1,4 @@
+import asyncio
 import math
 import re
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from app.domain.rag import (
     TreeIndexNode,
     TreeNodeType,
     TreeRetrievalReport,
+    TreeVectorMatch,
 )
 
 
@@ -20,10 +22,12 @@ class _Candidate:
     vector_score: float
     source: RetrievalSource
     expanded_from: str | None = None
+    paper_score: float = 0.0
+    section_score: float = 0.0
 
 
 class TreeRagRetriever:
-    """Retrieve content chunks with TreeRAG leaf-to-root-to-leaves expansion."""
+    """Retrieve globally with paper -> section -> chunk routing and tree expansion."""
 
     def __init__(
         self,
@@ -35,6 +39,11 @@ class TreeRagRetriever:
         max_expanded_per_hit: int = 8,
         max_candidates: int = 40,
         max_chunks_per_paper: int = 8,
+        paper_top_k: int = 5,
+        sections_per_paper: int = 3,
+        global_fallback_top_k: int = 6,
+        min_ranking_score: float = 0.20,
+        score_window: float = 0.18,
     ) -> None:
         limits = {
             "initial_top_k": initial_top_k,
@@ -42,9 +51,16 @@ class TreeRagRetriever:
             "max_expanded_per_hit": max_expanded_per_hit,
             "max_candidates": max_candidates,
             "max_chunks_per_paper": max_chunks_per_paper,
+            "paper_top_k": paper_top_k,
+            "sections_per_paper": sections_per_paper,
+            "global_fallback_top_k": global_fallback_top_k,
         }
         if any(value < 1 for value in limits.values()):
             raise ValueError("All retrieval limits must be positive")
+        if not -1.0 <= min_ranking_score <= 1.0:
+            raise ValueError("min_ranking_score must be between -1 and 1")
+        if score_window < 0:
+            raise ValueError("score_window cannot be negative")
         self._embedder = embedder
         self._vector_store = vector_store
         self._initial_top_k = initial_top_k
@@ -52,42 +68,111 @@ class TreeRagRetriever:
         self._max_expanded_per_hit = max_expanded_per_hit
         self._max_candidates = max_candidates
         self._max_chunks_per_paper = max_chunks_per_paper
+        self._paper_top_k = paper_top_k
+        self._sections_per_paper = sections_per_paper
+        self._global_fallback_top_k = global_fallback_top_k
+        self._min_ranking_score = min_ranking_score
+        self._score_window = score_window
 
     async def retrieve(
         self,
         query: str,
         *,
-        paper_ids: list[str],
+        paper_ids: list[str] | None = None,
         mode: RetrievalMode,
     ) -> TreeRetrievalReport:
         if not query.strip():
             raise ValueError("Retrieval query cannot be empty")
-        if not paper_ids:
-            raise ValueError("At least one paper_id is required")
+        requested_paper_ids = list(dict.fromkeys(paper_ids)) if paper_ids else []
         query_embedding = await self._embedder.embed_query(query)
-        initial = await self._vector_store.similarity_search(
+        root_matches = await self._vector_store.similarity_search(
             query_embedding,
-            paper_ids=paper_ids,
-            top_k=self._initial_top_k,
-            chunks_only=not mode.expands_tree,
+            paper_ids=requested_paper_ids or None,
+            top_k=max(self._paper_top_k, len(requested_paper_ids)),
+            chunks_only=False,
+            node_types=[TreeNodeType.ROOT],
         )
+        routed_paper_ids = (
+            requested_paper_ids
+            if requested_paper_ids
+            else list(
+                dict.fromkeys(match.node.paper_id for match in root_matches)
+            )[: self._paper_top_k]
+        )
+
+        section_matches = []
+        selected_sections: list[TreeIndexNode] = []
+        if routed_paper_ids:
+            per_paper_matches = await asyncio.gather(
+                *(
+                    self._vector_store.similarity_search(
+                        query_embedding,
+                        paper_ids=[paper_id],
+                        top_k=self._sections_per_paper,
+                        chunks_only=False,
+                        node_types=[TreeNodeType.SECTION],
+                    )
+                    for paper_id in routed_paper_ids
+                )
+            )
+            section_matches = [
+                match for paper_matches in per_paper_matches for match in paper_matches
+            ]
+            selected_sections = self._select_sections(section_matches)
+
+        hierarchical_matches = []
+        if selected_sections:
+            hierarchical_matches = await self._vector_store.similarity_search(
+                query_embedding,
+                paper_ids=routed_paper_ids,
+                top_k=self._initial_top_k,
+                chunks_only=True,
+                parent_ids=[node.node_id for node in selected_sections],
+            )
+        fallback_matches = await self._vector_store.similarity_search(
+            query_embedding,
+            paper_ids=requested_paper_ids or None,
+            top_k=self._global_fallback_top_k,
+            chunks_only=True,
+        )
+
         candidates: dict[str, _Candidate] = {}
-        for match in initial:
+        for match in [*hierarchical_matches, *fallback_matches]:
             if match.node.node_type is TreeNodeType.CHUNK:
+                existing = candidates.get(match.node.node_id)
+                if existing is not None and existing.vector_score >= match.vector_score:
+                    continue
                 candidates[match.node.node_id] = _Candidate(
                     node=match.node,
                     vector_score=match.vector_score,
                     source=RetrievalSource.VECTOR,
                 )
 
-        if mode.expands_tree and initial:
-            indexed_nodes = await self._vector_store.load_paper_nodes(paper_ids)
+        candidate_paper_ids = list(
+            dict.fromkeys(
+                [
+                    *routed_paper_ids,
+                    *(candidate.node.paper_id for candidate in candidates.values()),
+                ]
+            )
+        )
+        indexed_nodes = (
+            await self._vector_store.load_paper_nodes(candidate_paper_ids)
+            if candidate_paper_ids
+            else []
+        )
+        if mode.expands_tree and indexed_nodes:
             self._expand_candidates(
                 candidates=candidates,
-                initial_nodes=[match.node for match in initial],
+                initial_nodes=selected_sections,
                 indexed_nodes=indexed_nodes,
                 query_embedding=query_embedding,
             )
+        self._add_hierarchy_scores(
+            candidates=candidates,
+            indexed_nodes=indexed_nodes,
+            query_embedding=query_embedding,
+        )
 
         expanded_count = sum(
             candidate.source is RetrievalSource.TREE_EXPANSION
@@ -101,6 +186,7 @@ class TreeRagRetriever:
             key=lambda item: item[1],
             reverse=True,
         )[: self._max_candidates]
+        ranked = self._filter_weak_candidates(ranked)
         diversified = self._enforce_paper_cap(ranked)[: self._final_top_k]
         hits = [
             RetrievalHit(
@@ -108,6 +194,9 @@ class TreeRagRetriever:
                 node_id=candidate.node.node_id,
                 paper_id=candidate.node.paper_id,
                 section_path=candidate.node.section_path,
+                semantic_role=candidate.node.semantic_role,
+                block_types=candidate.node.block_types,
+                object_labels=candidate.node.object_labels,
                 page_start=candidate.node.page_start,
                 page_end=candidate.node.page_end,
                 text=candidate.node.text,
@@ -121,11 +210,63 @@ class TreeRagRetriever:
         return TreeRetrievalReport(
             query=query,
             mode=mode,
-            paper_ids=paper_ids,
-            initial_hit_count=len(initial),
+            paper_ids=requested_paper_ids,
+            searched_globally=not requested_paper_ids,
+            candidate_paper_ids=candidate_paper_ids,
+            initial_hit_count=len(hierarchical_matches) + len(fallback_matches),
             expanded_candidate_count=expanded_count,
             hits=hits,
         )
+
+    def _select_sections(
+        self,
+        matches: list[TreeVectorMatch],
+    ) -> list[TreeIndexNode]:
+        counts: dict[str, int] = {}
+        selected: list[TreeIndexNode] = []
+        for match in matches:
+            node = match.node
+            if node.node_type is not TreeNodeType.SECTION:
+                continue
+            count = counts.get(node.paper_id, 0)
+            if count >= self._sections_per_paper:
+                continue
+            selected.append(node)
+            counts[node.paper_id] = count + 1
+        return selected
+
+    def _add_hierarchy_scores(
+        self,
+        *,
+        candidates: dict[str, _Candidate],
+        indexed_nodes: list[IndexedTreeNode],
+        query_embedding: list[float],
+    ) -> None:
+        by_id = {item.node.node_id: item for item in indexed_nodes}
+        roots = {
+            item.node.paper_id: item
+            for item in indexed_nodes
+            if item.node.node_type is TreeNodeType.ROOT
+        }
+        for node_id, candidate in list(candidates.items()):
+            parent = by_id.get(candidate.node.parent_id or "")
+            root = roots.get(candidate.node.paper_id)
+            candidates[node_id] = _Candidate(
+                node=candidate.node,
+                vector_score=candidate.vector_score,
+                source=candidate.source,
+                expanded_from=candidate.expanded_from,
+                paper_score=(
+                    self._cosine_similarity(query_embedding, root.embedding)
+                    if root is not None
+                    else 0.0
+                ),
+                section_score=(
+                    self._cosine_similarity(query_embedding, parent.embedding)
+                    if parent is not None
+                    else 0.0
+                ),
+            )
 
     def _expand_candidates(
         self,
@@ -201,6 +342,16 @@ class TreeRagRetriever:
             counts[candidate.node.paper_id] = count + 1
         return selected
 
+    def _filter_weak_candidates(
+        self,
+        candidates: list[tuple[_Candidate, float]],
+    ) -> list[tuple[_Candidate, float]]:
+        if not candidates:
+            return []
+        best_score = candidates[0][1]
+        threshold = max(self._min_ranking_score, best_score - self._score_window)
+        return [item for item in candidates if item[1] >= threshold]
+
     @classmethod
     def _ranking_score(cls, query: str, candidate: _Candidate) -> float:
         """Lightweight hybrid rerank before a dedicated cross-encoder is configured."""
@@ -212,7 +363,12 @@ class TreeRagRetriever:
             if query_terms
             else 0.0
         )
-        return 0.85 * candidate.vector_score + 0.15 * lexical_score
+        return (
+            0.50 * candidate.vector_score
+            + 0.25 * candidate.section_score
+            + 0.15 * candidate.paper_score
+            + 0.10 * lexical_score
+        )
 
     @staticmethod
     def _terms(text: str) -> set[str]:

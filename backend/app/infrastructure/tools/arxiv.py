@@ -1,6 +1,5 @@
 import asyncio
 import re
-from collections.abc import Sequence
 from datetime import datetime
 from time import monotonic
 from xml.etree import ElementTree
@@ -8,7 +7,13 @@ from xml.etree import ElementTree
 import httpx
 from pydantic import HttpUrl
 
-from app.domain.papers import ArxivSearchInput, Paper
+from app.domain.papers import (
+    Paper,
+    PaperSearchAttempt,
+    PaperSearchInput,
+    PaperSearchResult,
+    PaperSource,
+)
 from app.domain.ports import PaperSearchGateway
 
 ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
@@ -51,7 +56,7 @@ class ArxivPaperSearchGateway(PaperSearchGateway):
         self._request_lock = asyncio.Lock()
         self._last_request_started_at: float | None = None
 
-    async def search(self, search_input: ArxivSearchInput) -> Sequence[Paper]:
+    async def search(self, search_input: PaperSearchInput) -> PaperSearchResult:
         params = self._build_params(search_input)
         headers = {"User-Agent": "PaperPilot/0.1 (academic research assistant)"}
         async with self._request_lock:
@@ -59,7 +64,18 @@ class ArxivPaperSearchGateway(PaperSearchGateway):
                 response = await self._request_with_retry(client, params)
 
         try:
-            return self._parse_feed(response.text)
+            papers = self._parse_feed(response.text)
+            return PaperSearchResult(
+                papers=papers,
+                provider=PaperSource.ARXIV if papers else None,
+                attempts=[
+                    PaperSearchAttempt(
+                        provider=PaperSource.ARXIV,
+                        status="completed" if papers else "empty",
+                        result_count=len(papers),
+                    )
+                ],
+            )
         except (ElementTree.ParseError, ValueError) as error:
             raise ArxivApiError(
                 "arXiv returned an invalid Atom feed",
@@ -94,8 +110,10 @@ class ArxivPaperSearchGateway(PaperSearchGateway):
 
             retry_after = self._retry_after_seconds(response)
             retryable = response.status_code == 429 or response.status_code >= 500
-            category = "rate_limited" if response.status_code == 429 else (
-                "provider_error" if response.status_code >= 500 else "request_rejected"
+            category = (
+                "rate_limited"
+                if response.status_code == 429
+                else ("provider_error" if response.status_code >= 500 else "request_rejected")
             )
             last_error = ArxivApiError(
                 self._error_message(response.status_code),
@@ -121,9 +139,7 @@ class ArxivPaperSearchGateway(PaperSearchGateway):
     async def _wait_for_request_slot(self) -> None:
         if self._last_request_started_at is None:
             return
-        remaining = self._min_request_interval - (
-            monotonic() - self._last_request_started_at
-        )
+        remaining = self._min_request_interval - (monotonic() - self._last_request_started_at)
         if remaining > 0:
             await asyncio.sleep(remaining)
 
@@ -146,7 +162,7 @@ class ArxivPaperSearchGateway(PaperSearchGateway):
         return f"arXiv rejected the request (HTTP {status_code})"
 
     @staticmethod
-    def _build_params(search_input: ArxivSearchInput) -> dict[str, str]:
+    def _build_params(search_input: PaperSearchInput) -> dict[str, str]:
         id_match = ARXIV_ID_PATTERN.search(search_input.query)
         params = {
             "start": "0",
@@ -157,9 +173,7 @@ class ArxivPaperSearchGateway(PaperSearchGateway):
         if id_match is not None:
             params["id_list"] = id_match.group(1)
         else:
-            params["search_query"] = ArxivPaperSearchGateway._all_fields_query(
-                search_input.query
-            )
+            params["search_query"] = ArxivPaperSearchGateway._all_fields_query(search_input.query)
         return params
 
     @staticmethod
@@ -185,16 +199,15 @@ class ArxivPaperSearchGateway(PaperSearchGateway):
             abstract_url = entry_id.replace("http://", "https://")
             links = entry.findall(f"{atom}link")
             pdf_url = next(
-                (
-                    link.attrib.get("href")
-                    for link in links
-                    if link.attrib.get("title") == "pdf"
-                ),
+                (link.attrib.get("href") for link in links if link.attrib.get("title") == "pdf"),
                 None,
             )
             papers.append(
                 Paper(
+                    paper_id=f"arxiv:{entry_id.rsplit('/', maxsplit=1)[-1]}",
+                    source=PaperSource.ARXIV,
                     arxiv_id=entry_id.rsplit("/", maxsplit=1)[-1],
+                    external_ids={"arxiv": entry_id.rsplit("/", maxsplit=1)[-1]},
                     title=ArxivPaperSearchGateway._normalize_text(
                         ArxivPaperSearchGateway._required_text(entry, f"{atom}title")
                     ),
@@ -206,14 +219,16 @@ class ArxivPaperSearchGateway(PaperSearchGateway):
                         for author in entry.findall(f"{atom}author")
                     ],
                     published_at=datetime.fromisoformat(
-                        ArxivPaperSearchGateway._required_text(entry, f"{atom}published")
-                        .replace("Z", "+00:00")
+                        ArxivPaperSearchGateway._required_text(entry, f"{atom}published").replace(
+                            "Z", "+00:00"
+                        )
                     ),
                     updated_at=datetime.fromisoformat(
-                        ArxivPaperSearchGateway._required_text(entry, f"{atom}updated")
-                        .replace("Z", "+00:00")
+                        ArxivPaperSearchGateway._required_text(entry, f"{atom}updated").replace(
+                            "Z", "+00:00"
+                        )
                     ),
-                    abstract_url=HttpUrl(abstract_url),
+                    landing_page_url=HttpUrl(abstract_url),
                     pdf_url=HttpUrl(pdf_url) if pdf_url is not None else None,
                 )
             )

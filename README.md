@@ -8,13 +8,13 @@ PaperPilot 是一个可观测的同步多 Agent 文献研究骨架：Supervisor 
 
 - Next.js + React + strict TypeScript
 - FastAPI 异步 API 和 `text/event-stream`
-- LangGraph `Supervisor → specialized agent → Supervisor → Writer` 状态循环
+- LangGraph Supervisor 路由、Reader 快慢双路径和统一证据 Judge
 - DeepSeek（OpenAI-compatible API）和结构化 Tool Calling
-- arXiv Atom API 检索、标题/摘要相关性筛选、查询改写和结果去重
+- 固定 `OpenAlex → Semantic Scholar → arXiv` 学术检索回退链、相关性筛选和查询改写
 - arXiv PDF 安全下载、受限全文提取和带页码证据的快速阅读
 - TreeRAG 风格的科学论文解析、层级 Chunk、祖先标题前缀和 Chroma 向量索引
 - Chroma 向量召回、按任务模式双向树扩展和轻量混合 rerank
-- PDF 上传、本地论文选择和 Reader 驱动的 RAG 证据阅读
+- PDF 上传、全库检索和 Reader 驱动的 RAG 证据阅读
 - Search / Reader / Analyst / Writer 职责隔离
 - SQLite + SQLAlchemy 2.0 异步持久化
 - token 流、阶段摘要、工具参数、论文结果、耗时和 token usage 展示
@@ -32,7 +32,7 @@ backend/app
   ├─ application      用例编排和任务生命周期
   ├─ infrastructure
   │  ├─ agent         LangGraph 图和事件发布
-  │  ├─ tools         arXiv API 适配器
+  │  ├─ tools         学术搜索回退链与 PDF 适配器
   │  └─ db            SQLAlchemy 持久化适配器
   └─ api              FastAPI DTO、依赖和路由
 ```
@@ -41,7 +41,8 @@ backend/app
 
 ```text
 START → Supervisor ─┬→ Search ───┐
-                    ├→ Reader ───┤
+                    ├→ Reader(deep) ─┤
+                    ├→ Reader(quick) → Judge → Writer → END
                     ├→ Analyst ──┤
                     └→ Writer → END
                                   │
@@ -58,8 +59,8 @@ Supervisor 只读取后者，不读取、预览或截断完整报告；Reader、
 `SUPERVISOR_MAX_STEPS` 只作为防止无限调度的最终安全预算。
 
 Supervisor 的下一步任务使用按 `agent` 区分的联合类型：Search 只接收查询和历史 Search
-Artifact；Reader 只接收阅读目标和一个论文 ID，arXiv 论文额外引用一个 Search
-Artifact；Analyst/Writer 接收明确的来源
+Artifact；Reader 接收严格限定的阅读目标、`quick/deep` 深度和可选论文 ID，外部论文
+额外引用一个 Search Artifact；Analyst/Writer 接收明确的来源
 Artifact ID 列表。不同 Agent 的字段不能混用，空列表也不再隐式代表“全部产物”。
 
 执行轨迹用来源标签区分 `AI 原话`、`工作流`、`策略规则`、`工具执行` 和`外部结果`。
@@ -73,14 +74,18 @@ Supervisor 会输出自己的观察、缺失信息、选择理由和执行目标
 
 Search 在单个节点内最多执行 `SEARCH_MAX_ITERATIONS` 轮“检索 → 结构化相关性筛选 →
 按缺口改写查询”，将论文区分为直接相关、相邻和无关，并把计数、理由和已尝试查询
-交给 Supervisor；是否满足整个用户任务仍由 Supervisor 决定。arXiv 客户端会对请求做
-串行限速，尊重数值型 `Retry-After` 并对 429/5xx/网络错误执行有限退避重试。最终失败会
-以 `rate_limited`、`provider_error` 等结构化状态进入 Search 摘要，不能再伪装成空结果。
-查询中出现 arXiv ID 时直接使用精确 `id_list`，普通关键词则逐项生成 `all:` 字段查询。
+交给 Supervisor；是否满足整个用户任务仍由 Supervisor 决定。模型只会看到一个
+`search_academic_papers` 工具，不能选择数据源。代码固定先查询 OpenAlex；请求失败或
+结果为空时查询 Semantic Scholar；仍失败或为空才使用 arXiv。三个客户端都会串行限速，
+尊重数值型 `Retry-After`，并对 429/5xx/网络错误执行有限退避重试。每次 provider 尝试
+都会进入工具事件与持久化摘要，全部失败时以结构化错误进入 Search 摘要。查询中出现
+arXiv ID 时，最终兜底会使用精确 `id_list`，普通关键词则逐项生成 `all:` 字段查询。
 
-Reader 是独立的 LangGraph 子图，在本地论文上执行“规划 → 检索 → 证据检查 → 按缺口
-改写查询 → 总结”；检索词、检索模式和补检决定均由 Reader 自己负责，最多执行
-`READER_MAX_RETRIEVAL_ROUNDS` 轮。Reader 也可以按 Supervisor 指定的
+Reader 是独立的 LangGraph 子图。窄问题走 `quick` 路径，以用户问题作为单次精准检索
+目标，跳过规划模型且禁止补检；复杂任务走 `deep` 路径，执行“规划 → 检索 → 按必要
+缺口改写查询”。两条路径统一经过 LLM-as-a-Judge，充分性只按用户原问题判断，而不以
+全面阅读论文为目标。`deep` 最多执行 `READER_MAX_RETRIEVAL_ROUNDS` 轮；`quick` 完成后
+直接进入 Writer，不再返回 Supervisor 扩题。Reader 也可以按 Supervisor 指定的
 `paper_id` 下载一篇 arXiv PDF，用 `pypdf` 提取带 `PAGE` 标记的受限全文并快速总结
 方法、组件、实验、结果和局限。下载大小、页数和输入字符均有配置上限；扫描版 PDF、
 复杂版面/公式视觉理解和 OCR 尚不支持，截断及提取警告会进入证据范围。
@@ -88,19 +93,28 @@ Reader 的内部计划和证据状态保持结构化，但不再强制生成包�
 论文报告；元数据足以回答时会跳过 RAG/PDF 下载，最终由 Writer 根据问题范围自然组织
 语言，小问题默认直接回答。
 
-独立的论文建库流程不经过在线 Supervisor：`PypdfScientificPaperParser` 优先复用论文
-原生章节编号构建父子层级，`TreeRagChunker` 按段落语义边界生成叶节点，并按照 TreeRAG
-公式将论文标题与全部祖先章节标题放在正文之前生成 embedding 输入。根、章节和内容
-Chunk 都写入同一 Chroma collection；原文、父节点、子节点、章节路径、页码和内容哈希
-作为记录或 metadata 保存。`TreeRagRetriever` 对事实问题仅召回内容叶节点；对总结、方法、
-比较和综合任务，允许根/章节/叶节点参与初始召回，再执行 leaf-to-root-to-leaves 扩展，
-将候选还原为可引用的内容 Chunk。最终结果先按 embedding 相似度与查询词覆盖率进行轻量
-混合 rerank，并限制单篇论文的返回数量。当前不使用 LLM 重建已有论文标题。上传的 PDF
-和 manifest 保存在 `PAPER_LIBRARY_PATH`，索引保存在 Chroma；前端选择的 `paper_ids`
-会随本轮问题传给 Supervisor。Reader 根据结构化任务调用检索器，完整 Chunk 证据只进入
-Reader Artifact，Supervisor 仍只读取 Reader 摘要。
+独立的论文建库流程不经过在线 Supervisor：`PypdfScientificPaperParser` 使用 PyMuPDF
+保留字体、坐标和阅读顺序，自动识别双栏版面，并综合编号、字号、粗体、留白和重复样式
+推断章节层级；固定章节名仅用于映射 `methods`、`results` 等语义角色，不再作为主要识别
+规则。解析结果会区分正文、caption、表格、图片区域和公式；无边框表格无法可靠恢复单元格
+时保留 caption 与邻近原文，而不会把整页误识别成表格。`TreeRagChunker` 按段落语义边界
+生成叶节点，表格、图片、公式块保持原子性，并按照 TreeRAG 公式将论文标题与全部祖先章节
+标题放在正文之前生成 embedding 输入。根、章节和内容 Chunk 都写入同一 Chroma collection；
+原文、父节点、子节点、章节路径、语义角色、版面块类型、对象编号、页码和内容哈希作为记录
+或 metadata 保存。根节点的向量文本包含标题、摘要、关键词和章节目录，章节节点包含路径、
+语义角色和代表性正文。`TreeRagRetriever` 默认按 Paper Root → Section → Chunk 自动分层
+检索，不要求用户或 Agent 预选论文；同时保留少量全库 Chunk 召回作为兜底，避免摘要或章节
+路由漏掉只在正文出现的细节。候选结果综合 Chunk、所属章节、所属论文和查询词覆盖率进行
+parent-aware rerank，并按绝对阈值和相对分差过滤低质量结果，因此 Top K 是上限而不是必须
+填满。总结、方法、比较和综合任务还会在相关章节内执行 tree expansion，将候选还原为可
+引用的内容 Chunk，并限制单篇论文的返回数量。当前不使用 LLM 重建已有论文标题。上传的 PDF
+和 manifest 保存在 `PAPER_LIBRARY_PATH`，索引保存在 Chroma。检索报告会记录自动命中的论文
+范围。Reader 根据结构化任务调用
+检索器，完整 Chunk 证据只进入 Reader Artifact，Supervisor 仍只读取 Reader 摘要。
 
-Agent 节点不直接请求 arXiv，应用服务不直接操作 SQLAlchemy，前端不依赖 LangGraph 的内部事件格式。接口使用 ABC、Pydantic、dataclass、TypedDict 和 TypeScript interface 明确表达。
+Agent 节点不直接请求外部论文 API，应用服务不直接操作 SQLAlchemy，前端不依赖
+LangGraph 的内部事件格式。接口使用 ABC、Pydantic、dataclass、TypedDict 和
+TypeScript interface 明确表达。
 
 ## 本地启动
 
@@ -110,7 +124,9 @@ Agent 节点不直接请求 arXiv，应用服务不直接操作 SQLAlchemy，前
 Copy-Item .env.example .env
 ```
 
-填写 `DEEPSEEK_API_KEY`。默认模型为 `deepseek-v4-flash`，默认服务地址为
+填写 `DEEPSEEK_API_KEY`。OpenAlex 与 Semantic Scholar 的 API key 均为可选配置：
+`OPENALEX_API_KEY`、`SEMANTIC_SCHOLAR_API_KEY`；生产或持续使用时建议配置，以获得各自
+账户对应的限额。默认模型为 `deepseek-v4-flash`，默认服务地址为
 `https://api.deepseek.com`。也支持通用的 `LLM_API_KEY`、`LLM_BASE_URL`、
 `LLM_MODEL`，并兼容原有的 `OPENAI_*` 变量名。
 
@@ -221,6 +237,6 @@ npm run build
 ## 下一步适合扩展
 
 1. 将 SQLite 换成 PostgreSQL，并为 LangGraph 增加数据库 checkpointer，实现断点恢复。
-2. 为 Reader 增加 query decomposition、证据充分性判断和二次检索闭环。
+2. 为 quick/deep 路由和证据 Judge 增加固定 benchmark 与阈值校准。
 3. 将同步的多篇 Reader 调度升级为 Orchestrator–Worker 并行执行。
 4. 增加固定 benchmark，评估路由、工具成功率、引用准确率和端到端延迟。

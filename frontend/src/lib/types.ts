@@ -83,13 +83,16 @@ export interface AgentRun {
 
 export interface PaperResult {
   [key: string]: JsonValue;
-  arxiv_id: string;
+  paper_id: string;
+  source: "openalex" | "semantic_scholar" | "arxiv";
+  arxiv_id: string | null;
+  external_ids: Record<string, string>;
   title: string;
   summary: string;
   authors: string[];
-  published_at: string;
-  updated_at: string;
-  abstract_url: string;
+  published_at: string | null;
+  updated_at: string | null;
+  landing_page_url: string;
   pdf_url: string | null;
 }
 
@@ -119,9 +122,13 @@ export interface PaperTreeNode {
   children_ids: string[];
   level: number;
   section_path: string[];
+  semantic_role: string | null;
+  block_types: Array<"text" | "table" | "figure" | "equation" | "caption">;
+  object_labels: string[];
   page_start: number | null;
   page_end: number | null;
   text_preview: string;
+  text: string;
 }
 
 export interface IndexedPaperDetail {

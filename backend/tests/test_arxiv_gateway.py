@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from app.domain.papers import ArxivSearchInput
+from app.domain.papers import PaperSearchInput
 from app.infrastructure.tools.arxiv import ArxivApiError, ArxivPaperSearchGateway
 
 
@@ -30,7 +30,7 @@ def test_parse_feed_returns_typed_paper() -> None:
 
 def test_known_arxiv_id_uses_exact_id_list() -> None:
     params = ArxivPaperSearchGateway._build_params(
-        ArxivSearchInput(query="Read arXiv:2409.13740 and summarize it", max_results=10)
+        PaperSearchInput(query="Read arXiv:2409.13740 and summarize it", max_results=10)
     )
 
     assert params["id_list"] == "2409.13740"
@@ -39,7 +39,7 @@ def test_known_arxiv_id_uses_exact_id_list() -> None:
 
 def test_keyword_query_scopes_every_term() -> None:
     params = ArxivPaperSearchGateway._build_params(
-        ArxivSearchInput(query='PaperQA "scientific literature QA"', max_results=5)
+        PaperSearchInput(query='PaperQA "scientific literature QA"', max_results=5)
     )
 
     assert params["search_query"] == 'all:PaperQA AND all:"scientific literature QA"'

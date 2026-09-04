@@ -65,6 +65,25 @@ async def get_paper_detail(
     return IndexedPaperDetailResponse.from_domain(detail)
 
 
+@router.delete("/{paper_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_paper(
+    paper_id: str,
+    service: Annotated[PaperLibraryService, Depends(get_paper_library)],
+) -> None:
+    try:
+        await service.delete_paper(paper_id)
+    except PaperNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Indexed paper not found",
+        ) from error
+    except (OSError, RuntimeError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Paper deletion failed: {error}",
+        ) from error
+
+
 @router.post("/retrieve", response_model=TreeRetrievalResponse)
 async def retrieve_papers(
     request: RetrievePaperRequest,

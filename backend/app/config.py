@@ -42,6 +42,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    openalex_api_url: str = "https://api.openalex.org"
+    openalex_api_key: SecretStr = SecretStr("")
+    openalex_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
+    openalex_min_request_interval_seconds: float = Field(default=0.1, ge=0, le=60)
+    openalex_max_retries: int = Field(default=1, ge=0, le=3)
+    openalex_retry_backoff_seconds: float = Field(default=1.0, ge=0, le=60)
+    semantic_scholar_api_url: str = "https://api.semanticscholar.org/graph/v1"
+    semantic_scholar_api_key: SecretStr = SecretStr("")
+    semantic_scholar_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
+    semantic_scholar_min_request_interval_seconds: float = Field(default=1.0, ge=0, le=60)
+    semantic_scholar_max_retries: int = Field(default=1, ge=0, le=3)
+    semantic_scholar_retry_backoff_seconds: float = Field(default=1.0, ge=0, le=60)
     arxiv_api_url: str = "https://export.arxiv.org/api/query"
     arxiv_timeout_seconds: float = 20.0
     arxiv_min_request_interval_seconds: float = Field(default=3.0, ge=0, le=60)
@@ -76,6 +88,11 @@ class Settings(BaseSettings):
     retrieval_max_expanded_per_hit: int = Field(default=8, ge=1, le=100)
     retrieval_max_candidates: int = Field(default=40, ge=1, le=500)
     retrieval_max_chunks_per_paper: int = Field(default=8, ge=1, le=100)
+    retrieval_paper_top_k: int = Field(default=5, ge=1, le=50)
+    retrieval_sections_per_paper: int = Field(default=3, ge=1, le=20)
+    retrieval_global_fallback_top_k: int = Field(default=6, ge=1, le=100)
+    retrieval_min_ranking_score: float = Field(default=0.20, ge=-1.0, le=1.0)
+    retrieval_score_window: float = Field(default=0.18, ge=0.0, le=2.0)
 
 
 @lru_cache(maxsize=1)

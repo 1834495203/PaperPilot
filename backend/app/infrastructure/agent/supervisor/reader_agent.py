@@ -24,13 +24,17 @@ from app.infrastructure.agent.supervisor.models import (
     AgentName,
     ArtifactKind,
     CompletedStep,
+    DecisionAssessment,
     DecisionSource,
     ReaderAgentSummary,
+    ReaderDepth,
     ReaderTask,
     ReadingEvidenceAssessment,
     ReadingPlan,
     ReadingReport,
     SearchReport,
+    SupervisorDecision,
+    WriterTask,
 )
 from app.infrastructure.agent.supervisor.prompts import (
     READER_EVIDENCE_PROMPT,
@@ -89,12 +93,13 @@ class ReaderStateUpdate(TypedDict, total=False):
     tool_calls: int
 
 
-ReaderRoute = Literal["retrieve", "fetch", "synthesize"]
+PreparationRoute = Literal["quick_plan", "plan"]
+ReaderRoute = Literal["retrieve", "fetch", "judge"]
 EvidenceRoute = Literal["retrieve", "synthesize"]
 
 
 class ReaderAgentGraph:
-    """Single-paper plan-retrieve-assess-read LangGraph subgraph."""
+    """Plan-retrieve-assess-read LangGraph subgraph for local or external evidence."""
 
     def __init__(
         self,
@@ -117,23 +122,33 @@ class ReaderAgentGraph:
 
         builder = StateGraph(ReaderState, context_schema=AgentRunContext)
         builder.add_node("prepare", self._prepare)
+        builder.add_node("quick_plan", self._quick_plan)
         builder.add_node("plan", self._plan)
         builder.add_node("fetch", self._fetch)
         builder.add_node("retrieve", self._retrieve)
-        builder.add_node("assess", self._assess)
+        builder.add_node("judge", self._judge)
         builder.add_node("synthesize", self._synthesize)
         builder.add_edge(START, "prepare")
-        builder.add_edge("prepare", "plan")
+        builder.add_conditional_edges(
+            "prepare",
+            self._route_after_prepare,
+            {"quick_plan": "quick_plan", "plan": "plan"},
+        )
+        builder.add_conditional_edges(
+            "quick_plan",
+            self._route_after_plan,
+            {"retrieve": "retrieve", "fetch": "fetch", "judge": "judge"},
+        )
         builder.add_conditional_edges(
             "plan",
             self._route_after_plan,
-            {"retrieve": "retrieve", "fetch": "fetch", "synthesize": "synthesize"},
+            {"retrieve": "retrieve", "fetch": "fetch", "judge": "judge"},
         )
-        builder.add_edge("fetch", "synthesize")
-        builder.add_edge("retrieve", "assess")
+        builder.add_edge("fetch", "judge")
+        builder.add_edge("retrieve", "judge")
         builder.add_conditional_edges(
-            "assess",
-            self._route_after_assessment,
+            "judge",
+            self._route_after_judgment,
             {"retrieve": "retrieve", "synthesize": "synthesize"},
         )
         builder.add_edge("synthesize", END)
@@ -158,7 +173,7 @@ class ReaderAgentGraph:
         local_metadata: dict[str, JsonValue] | None = None
         material_error: str | None = None
         if state["is_local_paper"]:
-            if self._paper_library is not None:
+            if self._paper_library is not None and task.paper_id is not None:
                 try:
                     paper = await self._paper_library.get_paper(task.paper_id)
                     local_metadata = cast(
@@ -174,13 +189,41 @@ class ReaderAgentGraph:
                     "The requested paper ID was not found in the selected search artifact"
                 )
             else:
-                local_metadata = cast(
-                    dict[str, JsonValue], candidate.paper.model_dump(mode="json")
-                )
+                local_metadata = cast(dict[str, JsonValue], candidate.paper.model_dump(mode="json"))
         return {
             "local_metadata": local_metadata,
             "material_error": material_error,
         }
+
+    async def _quick_plan(
+        self,
+        state: ReaderState,
+        runtime: Runtime[AgentRunContext],
+    ) -> ReaderStateUpdate:
+        task = state["task"]
+        needs_retrieval = (
+            state["is_local_paper"] and self._paper_retriever is not None
+        ) or (not state["is_local_paper"] and self._document_gateway is not None)
+        plan = ReadingPlan(
+            needs_retrieval=needs_retrieval,
+            query=task.objective if needs_retrieval else None,
+            mode=RetrievalMode.METHOD if needs_retrieval else None,
+            evidence_requirements=[task.objective],
+            rationale="Quick path uses the exact user-scoped objective for one retrieval",
+        )
+        await runtime.context.publisher.publish(
+            EventType.DECISION_RECORDED.value,
+            {
+                "source": DecisionSource.POLICY.value,
+                "actor": "reader",
+                "stage": "reader.quick_plan",
+                "summary": plan.rationale,
+                "needs_retrieval": plan.needs_retrieval,
+                "query": plan.query,
+                "retrieval_mode": plan.mode.value if plan.mode is not None else None,
+            },
+        )
+        return {"plan": plan}
 
     async def _plan(
         self,
@@ -195,8 +238,11 @@ class ReaderAgentGraph:
                 "source": DecisionSource.WORKFLOW.value,
                 "actor": "reader",
                 "stage": "reader.plan",
-                "summary": "Reader 正在制定单篇论文检索计划",
-                "paper_ids": [task.paper_id],
+                "summary": "Reader 正在制定论文库检索计划",
+                "paper_ids": [] if task.paper_id is None else [task.paper_id],
+                "retrieval_scope": (
+                    "all_local_papers" if task.paper_id is None else "single_paper"
+                ),
                 "objective": task.objective,
             },
         )
@@ -207,6 +253,11 @@ class ReaderAgentGraph:
                     content=json.dumps(
                         {
                             "paper_id": task.paper_id,
+                            "retrieval_scope": (
+                                "all_local_papers"
+                                if task.paper_id is None
+                                else "single_paper"
+                            ),
                             "paper_metadata": state["local_metadata"],
                             "reading_objective": task.objective,
                         },
@@ -228,9 +279,7 @@ class ReaderAgentGraph:
                 "retrieval_mode": (
                     result.value.mode.value if result.value.mode is not None else None
                 ),
-                "evidence_requirements": cast(
-                    JsonValue, result.value.evidence_requirements
-                ),
+                "evidence_requirements": cast(JsonValue, result.value.evidence_requirements),
             },
         )
         return {"plan": result.value, **self._usage_update(state, result.usage)}
@@ -283,7 +332,7 @@ class ReaderAgentGraph:
             "tool_calls": state["tool_calls"] + 1,
         }
 
-    async def _assess(
+    async def _judge(
         self,
         state: ReaderState,
         runtime: Runtime[AgentRunContext],
@@ -297,8 +346,8 @@ class ReaderAgentGraph:
             {
                 "source": DecisionSource.WORKFLOW.value,
                 "actor": "reader",
-                "stage": "reader.assess",
-                "summary": "Reader 正在检查单篇论文证据覆盖情况",
+                "stage": "reader.judge",
+                "summary": "Judge 正在按用户原问题检查证据充分性",
                 "retrieval_round": len(state["retrieval_reports"]),
             },
         )
@@ -309,11 +358,15 @@ class ReaderAgentGraph:
                     content=json.dumps(
                         {
                             "reading_objective": state["task"].objective,
+                            "reader_depth": state["task"].depth.value,
+                            "retrieval_can_retry": (
+                                state["task"].depth is ReaderDepth.DEEP
+                                and state["is_local_paper"]
+                                and self._paper_retriever is not None
+                                and state["retrieval_attempts"] < self._max_retrieval_rounds
+                            ),
                             "reading_plan": plan.model_dump(mode="json"),
-                            "retrieval_reports": [
-                                report.model_dump(mode="json")
-                                for report in state["retrieval_reports"]
-                            ],
+                            "available_material": self._reading_material(state),
                             "material_error": state["material_error"],
                         },
                         ensure_ascii=False,
@@ -328,15 +381,12 @@ class ReaderAgentGraph:
             {
                 "source": DecisionSource.MODEL.value,
                 "actor": "reader",
-                "stage": "reader.assess",
+                "stage": "reader.judge",
                 "summary": assessment.coverage_summary,
                 "evidence_sufficient": assessment.evidence_sufficient,
-                "covered_requirements": cast(
-                    JsonValue, assessment.covered_requirements
-                ),
-                "missing_requirements": cast(
-                    JsonValue, assessment.missing_requirements
-                ),
+                "covered_requirements": cast(JsonValue, assessment.covered_requirements),
+                "missing_requirements": cast(JsonValue, assessment.missing_requirements),
+                "retry_recommended": assessment.retry_recommended,
                 "next_query": assessment.next_query,
                 "next_mode": (
                     assessment.next_mode.value if assessment.next_mode is not None else None
@@ -356,10 +406,12 @@ class ReaderAgentGraph:
         del runtime
         task = state["task"]
         prompt = (
-            f"Assigned single-paper reading task:\n{task.objective}\n\n"
-            f"Selected paper ID:\n{task.paper_id}\n\n"
+            f"Assigned evidence-reading task:\n{task.objective}\n\n"
+            f"Reader depth:\n{task.depth.value}\n\n"
+            f"Retrieval scope:\n"
+            f"{'all locally indexed papers' if task.paper_id is None else task.paper_id}\n\n"
             f"Available material:\n{self._reading_material(state)}\n\n"
-            "Analyze only this paper. Do not evaluate the overall multi-paper workflow."
+            "Analyze only the supplied evidence. Do not evaluate the overall workflow."
         )
         result = await self._model.generate_structured(
             [SystemMessage(content=READER_PROMPT), HumanMessage(content=prompt)],
@@ -370,24 +422,32 @@ class ReaderAgentGraph:
             **self._usage_update(state, result.usage),
         }
 
+    @staticmethod
+    def _route_after_prepare(state: ReaderState) -> PreparationRoute:
+        return "quick_plan" if state["task"].depth is ReaderDepth.QUICK else "plan"
+
     def _route_after_plan(self, state: ReaderState) -> ReaderRoute:
         plan = state["plan"]
         if plan is None:
             raise ValueError("Reader planning node did not produce a plan")
         if not plan.needs_retrieval:
-            return "synthesize"
+            return "judge"
         if state["is_local_paper"] and self._paper_retriever is not None:
             return "retrieve"
         if not state["is_local_paper"] and self._document_gateway is not None:
             return "fetch"
-        return "synthesize"
+        return "judge"
 
-    def _route_after_assessment(self, state: ReaderState) -> EvidenceRoute:
+    def _route_after_judgment(self, state: ReaderState) -> EvidenceRoute:
         assessment = state["assessment"]
         if assessment is None:
             raise ValueError("Reader assessment node did not produce a decision")
         if (
-            not assessment.evidence_sufficient
+            state["task"].depth is ReaderDepth.DEEP
+            and state["is_local_paper"]
+            and self._paper_retriever is not None
+            and not assessment.evidence_sufficient
+            and assessment.retry_recommended
             and state["retrieval_attempts"] < self._max_retrieval_rounds
         ):
             return "retrieve"
@@ -410,9 +470,7 @@ class ReaderAgentGraph:
                     "paper_id": state["task"].paper_id,
                     "paper_metadata": state["local_metadata"],
                     "reading_plan": (
-                        state["plan"].model_dump(mode="json")
-                        if state["plan"] is not None
-                        else None
+                        state["plan"].model_dump(mode="json") if state["plan"] is not None else None
                     ),
                     "evidence_assessment": (
                         state["assessment"].model_dump(mode="json")
@@ -420,8 +478,7 @@ class ReaderAgentGraph:
                         else None
                     ),
                     "retrieval_rounds": [
-                        report.model_dump(mode="json")
-                        for report in state["retrieval_reports"]
+                        report.model_dump(mode="json") for report in state["retrieval_reports"]
                     ],
                     "instruction": (
                         "Treat paper_metadata as authoritative bibliographic metadata. "
@@ -471,7 +528,7 @@ class ReaderAgentGraph:
             return None, "Selected paper has no downloadable PDF URL"
         call_id = f"pdf-{uuid4()}"
         arguments: dict[str, JsonValue] = {
-            "arxiv_id": candidate.paper.arxiv_id,
+            "paper_id": candidate.paper.paper_id,
             "url": str(candidate.paper.pdf_url),
         }
         await self._publish_tool_started(context, call_id, "fetch_arxiv_pdf", arguments)
@@ -482,7 +539,7 @@ class ReaderAgentGraph:
         try:
             document = await self._document_gateway.fetch(str(candidate.paper.pdf_url))
             summary = {
-                "arxiv_id": candidate.paper.arxiv_id,
+                "paper_id": candidate.paper.paper_id,
                 "page_count": document.page_count,
                 "extracted_pages": document.extracted_pages,
                 "extracted_characters": document.extracted_characters,
@@ -520,7 +577,7 @@ class ReaderAgentGraph:
         self,
         context: AgentRunContext,
         *,
-        paper_id: str,
+        paper_id: str | None,
         query: str,
         mode: RetrievalMode,
     ) -> tuple[TreeRetrievalReport | None, str | None]:
@@ -529,21 +586,22 @@ class ReaderAgentGraph:
         call_id = f"rag-{uuid4()}"
         arguments: dict[str, JsonValue] = {
             "paper_id": paper_id,
+            "retrieval_scope": "all_local_papers" if paper_id is None else "single_paper",
             "query": query,
             "mode": mode.value,
         }
-        await self._publish_tool_started(
-            context, call_id, "retrieve_indexed_paper", arguments
-        )
+        await self._publish_tool_started(context, call_id, "retrieve_indexed_paper", arguments)
         started = perf_counter()
         report: TreeRetrievalReport | None = None
         error_message: str | None = None
         try:
             report = await self._paper_retriever.retrieve(
-                query, paper_ids=[paper_id], mode=mode
+                query,
+                paper_ids=None if paper_id is None else [paper_id],
+                mode=mode,
             )
             if not report.hits:
-                raise ValueError("No evidence chunks were retrieved for the selected paper")
+                raise ValueError("No evidence chunks were retrieved from the requested scope")
             await context.publisher.publish(
                 EventType.TOOL_COMPLETED.value,
                 {
@@ -554,6 +612,8 @@ class ReaderAgentGraph:
                     "initial_hit_count": report.initial_hit_count,
                     "expanded_candidate_count": report.expanded_candidate_count,
                     "hit_count": len(report.hits),
+                    "searched_globally": report.searched_globally,
+                    "candidate_paper_ids": cast(JsonValue, report.candidate_paper_ids),
                     "duration_ms": int((perf_counter() - started) * 1000),
                 },
             )
@@ -567,6 +627,8 @@ class ReaderAgentGraph:
                 "initial_hit_count": report.initial_hit_count,
                 "expanded_candidate_count": report.expanded_candidate_count,
                 "hit_count": len(report.hits),
+                "searched_globally": report.searched_globally,
+                "candidate_paper_ids": cast(JsonValue, report.candidate_paper_ids),
             }
             if report is not None
             else {"error": error_message}
@@ -686,21 +748,33 @@ class ReaderAgentNode:
                 "stage": "reader",
                 "summary": "Reader Agent 子图开始执行",
                 "objective": task.objective,
-                "paper_ids": [task.paper_id],
+                "reader_depth": task.depth.value,
+                "paper_ids": [] if task.paper_id is None else [task.paper_id],
+                "retrieval_scope": (
+                    "all_local_papers" if task.paper_id is None else "single_paper"
+                ),
             },
         )
         selected = select_artifacts(
             state["artifacts"],
             [task.source_artifact_id] if task.source_artifact_id is not None else [],
         )
-        is_local_paper = task.paper_id in context.paper_ids
+        is_local_paper = (
+            task.paper_id in context.paper_ids
+            if task.paper_id is not None
+            else context.local_corpus_available or bool(context.paper_ids)
+        )
         result = await self._graph.run(
             ReaderState(
                 task=task,
                 selected_artifacts=selected,
                 is_local_paper=is_local_paper,
                 local_metadata=None,
-                pdf_candidate=self._select_pdf_candidate(selected, task.paper_id),
+                pdf_candidate=(
+                    self._select_pdf_candidate(selected, task.paper_id)
+                    if task.paper_id is not None
+                    else None
+                ),
                 pdf_document=None,
                 material_error=None,
                 plan=None,
@@ -724,10 +798,11 @@ class ReaderAgentNode:
         pdf_document = result["pdf_document"]
         attempted_queries = result["attempted_queries"]
         unique_hit_count = self._unique_hit_count(retrieval_reports)
+        supervisor_summary = self._compact_summary(report.analysis_summary)
         artifact = AgentArtifact(
             title=f"Reading report: {report.paper_or_material}",
             supervisor_summary=ReaderAgentSummary(
-                summary=report.analysis_summary,
+                summary=supervisor_summary,
                 paper_or_material=report.paper_or_material,
                 objective_satisfied=report.objective_satisfied,
                 answered_points=report.answered_points,
@@ -744,13 +819,33 @@ class ReaderAgentNode:
             content=report.model_dump_json(),
             source_artifact_ids=[item.id for item in selected],
         )
+        judgment = result["assessment"]
+        next_decision: SupervisorDecision | None = None
+        if task.depth is ReaderDepth.QUICK:
+            missing = judgment.missing_requirements if judgment is not None else []
+            next_decision = SupervisorDecision(
+                assessment=DecisionAssessment(
+                    observations=["Quick Reader completed its single scoped evidence pass"],
+                    missing_information=missing,
+                    decision_summary=(
+                        "The quick path is complete; answer the exact question from its evidence"
+                    ),
+                ),
+                task=WriterTask(
+                    objective=(
+                        "Answer the user's exact question directly and concisely using the Reader "
+                        "artifact; state only material evidence limitations"
+                    ),
+                    source_artifact_ids=[artifact.id],
+                ),
+            )
         await context.publisher.publish(
             EventType.DECISION_RECORDED.value,
             {
                 "source": DecisionSource.MODEL.value,
                 "actor": "reader",
                 "stage": "reader",
-                "summary": report.analysis_summary,
+                "summary": supervisor_summary,
                 "artifact_id": str(artifact.id),
                 "source_count": len(selected),
                 "evidence_count": len(report.evidence),
@@ -776,7 +871,7 @@ class ReaderAgentNode:
                     artifact_id=artifact.id,
                 ),
             ],
-            "decision": None,
+            "decision": next_decision,
             **with_usage(
                 state,
                 ModelUsage(
@@ -790,6 +885,13 @@ class ReaderAgentNode:
         }
         await publish_metrics(context, update)
         return update
+
+    @staticmethod
+    def _compact_summary(value: str, max_length: int = 1_000) -> str:
+        normalized = " ".join(value.split())
+        if len(normalized) <= max_length:
+            return normalized
+        return f"{normalized[: max_length - 3].rstrip()}..."
 
     @staticmethod
     def _unique_hit_count(reports: list[TreeRetrievalReport]) -> int:
@@ -818,10 +920,9 @@ class ReaderAgentNode:
                 except (json.JSONDecodeError, ValueError):
                     papers = []
             candidates.extend(
-                PdfCandidate(paper=paper, source_artifact_id=str(artifact.id))
-                for paper in papers
+                PdfCandidate(paper=paper, source_artifact_id=str(artifact.id)) for paper in papers
             )
         return next(
-            (item for item in candidates if item.paper.arxiv_id == requested_paper_id),
+            (item for item in candidates if item.paper.paper_id == requested_paper_id),
             None,
         )

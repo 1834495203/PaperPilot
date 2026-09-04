@@ -91,7 +91,8 @@ class SupervisorNode:
         prompt = (
             f"User request:\n{state['user_request']}\n\n"
             f"Conversation context:\n{state['conversation_context']}\n\n"
-            f"Locally indexed paper IDs selected for this request:\n"
+            f"Local indexed corpus available:\n{context.local_corpus_available}\n\n"
+            f"Explicitly scoped local paper IDs (normally empty):\n"
             f"{list(context.paper_ids)}\n\n"
             f"Completed steps:\n{completed}\n\n"
             "Agent-authored supervisor summaries (detailed reports are available to downstream "
@@ -106,6 +107,7 @@ class SupervisorNode:
             state,
             result.value,
             local_paper_ids=set(context.paper_ids),
+            local_corpus_available=context.local_corpus_available,
         )
         for adjustment in resolution.adjustments:
             await self._publish_policy_decision(context, resolution.decision, adjustment)
@@ -176,6 +178,7 @@ class SupervisorNode:
         original: SupervisorDecision,
         *,
         local_paper_ids: set[str] | None = None,
+        local_corpus_available: bool = False,
     ) -> DecisionResolution:
         decision = original
         task = decision.task
@@ -206,7 +209,18 @@ class SupervisorNode:
                 )
                 task = task.model_copy(update={"prior_search_artifact_ids": valid_prior_ids})
         elif isinstance(task, ReaderTask):
-            if task.paper_id in available_local_ids:
+            if task.paper_id is None and (local_corpus_available or available_local_ids):
+                if task.source_artifact_id is not None:
+                    adjustments.append(
+                        PolicyAdjustment(
+                            rule="global_local_reader_does_not_require_search_source",
+                            summary="全库检索不需要 Search Artifact，已移除该引用",
+                            original_value=str(task.source_artifact_id),
+                            effective_value=None,
+                        )
+                    )
+                    task = task.model_copy(update={"source_artifact_id": None})
+            elif task.paper_id in available_local_ids:
                 if task.source_artifact_id is not None:
                     adjustments.append(
                         PolicyAdjustment(
@@ -286,7 +300,11 @@ class SupervisorNode:
                     if task.source_artifact_id is not None
                     else []
                 ),
-                "paper_ids": [task.paper_id],
+                "paper_ids": [] if task.paper_id is None else [task.paper_id],
+                "retrieval_scope": (
+                    "all_local_papers" if task.paper_id is None else "single_paper"
+                ),
+                "reader_depth": task.depth.value,
             }
         return {
             "artifact_ids": cast(

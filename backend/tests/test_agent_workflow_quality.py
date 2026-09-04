@@ -10,7 +10,7 @@ from langgraph.runtime import Runtime
 from app.application.agent import AgentRunContext
 from app.application.paper_library import PaperLibraryService
 from app.application.tree_retrieval import TreeRagRetriever
-from app.domain.papers import Paper
+from app.domain.papers import Paper, PaperSearchAttempt, PaperSearchResult, PaperSource
 from app.domain.ports import EventPublisher, PaperSearchGateway
 from app.domain.rag import (
     IndexedPaper,
@@ -22,7 +22,7 @@ from app.domain.rag import (
 )
 from app.domain.types import JsonValue
 from app.infrastructure.agent.recording import AgentExecutionRecorder
-from app.infrastructure.agent.search.tools import ArxivSearchAgentTool
+from app.infrastructure.agent.search.tools import AcademicPaperSearchAgentTool
 from app.infrastructure.agent.supervisor.analyst_agent import AnalystAgentNode
 from app.infrastructure.agent.supervisor.model_gateway import (
     AgentModelGateway,
@@ -40,6 +40,7 @@ from app.infrastructure.agent.supervisor.models import (
     PaperAssessment,
     PaperRelevance,
     ReaderAgentSummary,
+    ReaderDepth,
     ReaderTask,
     ReadingEvidenceAssessment,
     ReadingPlan,
@@ -75,13 +76,16 @@ class CapturingPublisher(EventPublisher):
 def make_paper(arxiv_id: str = "2401.00001") -> Paper:
     return Paper.model_validate(
         {
+            "paper_id": f"arxiv:{arxiv_id}",
+            "source": "arxiv",
             "arxiv_id": arxiv_id,
+            "external_ids": {"arxiv": arxiv_id},
             "title": "Directly Relevant Paper",
             "summary": "A paper about efficient LLM agent collaboration.",
             "authors": ["Ada Example"],
             "published_at": datetime.now(UTC),
             "updated_at": datetime.now(UTC),
-            "abstract_url": f"https://arxiv.org/abs/{arxiv_id}",
+            "landing_page_url": f"https://arxiv.org/abs/{arxiv_id}",
             "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
         }
     )
@@ -233,6 +237,16 @@ def test_reader_task_rejects_fields_from_other_agent_tasks() -> None:
         )
 
 
+def test_reader_compacts_long_report_for_supervisor_summary() -> None:
+    full_report = "检索文本解析与版面恢复。" * 200
+
+    summary = ReaderAgentNode._compact_summary(full_report)
+
+    assert len(summary) == 1_000
+    assert summary.endswith("...")
+    assert full_report.startswith(summary[:-3])
+
+
 def test_supervisor_respects_writer_decision_when_evidence_is_incomplete() -> None:
     decision = SupervisorDecision(
         assessment=DecisionAssessment(
@@ -250,18 +264,21 @@ def test_supervisor_respects_writer_decision_when_evidence_is_incomplete() -> No
 
 
 def test_search_screening_filters_unknown_ids_and_marks_omissions() -> None:
-    papers = {"2401.00001": make_paper(), "2401.00002": make_paper("2401.00002")}
+    papers = {
+        "arxiv:2401.00001": make_paper(),
+        "arxiv:2401.00002": make_paper("2401.00002"),
+    }
     screening = SearchScreening(
         screening_summary="One candidate is directly relevant",
         assessments=[
             PaperAssessment(
-                arxiv_id="2401.00001",
+                paper_id="arxiv:2401.00001",
                 relevance=PaperRelevance.DIRECT,
                 relevance_reason="It studies LLM agent collaboration",
                 matched_topics=["LLM agents", "collaboration"],
             ),
             PaperAssessment(
-                arxiv_id="unknown",
+                paper_id="unknown",
                 relevance=PaperRelevance.DIRECT,
                 relevance_reason="Not returned by the tool",
                 matched_topics=[],
@@ -271,11 +288,11 @@ def test_search_screening_filters_unknown_ids_and_marks_omissions() -> None:
     )
 
     normalized = SearchAgentNode._normalize_screening(screening, papers)
-    by_id = {item.arxiv_id: item for item in normalized.assessments}
+    by_id = {item.paper_id: item for item in normalized.assessments}
 
     assert set(by_id) == set(papers)
-    assert by_id["2401.00001"].relevance is PaperRelevance.DIRECT
-    assert by_id["2401.00002"].relevance is PaperRelevance.IRRELEVANT
+    assert by_id["arxiv:2401.00001"].relevance is PaperRelevance.DIRECT
+    assert by_id["arxiv:2401.00002"].relevance is PaperRelevance.IRRELEVANT
 
 
 @pytest.mark.asyncio
@@ -284,7 +301,7 @@ async def test_search_agent_executes_rewritten_query_after_weak_screening() -> N
     cast(AsyncMock, model.generate_tool_call).side_effect = [
         ToolCallModelResult(
             call_id="call-1",
-            tool_name="search_arxiv",
+            tool_name="search_academic_papers",
             arguments={
                 "query": "multi-agent collaboration",
                 "max_results": 10,
@@ -295,7 +312,7 @@ async def test_search_agent_executes_rewritten_query_after_weak_screening() -> N
         ),
         ToolCallModelResult(
             call_id="call-2",
-            tool_name="search_arxiv",
+            tool_name="search_academic_papers",
             arguments={
                 "query": "large language model agent communication protocol",
                 "max_results": 10,
@@ -311,7 +328,7 @@ async def test_search_agent_executes_rewritten_query_after_weak_screening() -> N
                 screening_summary="The first result is traditional MARL, not LLM agents",
                 assessments=[
                     PaperAssessment(
-                        arxiv_id="2401.00001",
+                        paper_id="arxiv:2401.00001",
                         relevance=PaperRelevance.IRRELEVANT,
                         relevance_reason="It does not study language-model agents",
                         matched_topics=["multi-agent"],
@@ -327,13 +344,13 @@ async def test_search_agent_executes_rewritten_query_after_weak_screening() -> N
                 screening_summary="The rewritten query returned a direct LLM-agent paper",
                 assessments=[
                     PaperAssessment(
-                        arxiv_id="2401.00001",
+                        paper_id="arxiv:2401.00001",
                         relevance=PaperRelevance.IRRELEVANT,
                         relevance_reason="It does not study language-model agents",
                         matched_topics=["multi-agent"],
                     ),
                     PaperAssessment(
-                        arxiv_id="2401.00002",
+                        paper_id="arxiv:2401.00002",
                         relevance=PaperRelevance.DIRECT,
                         relevance_reason="It studies communication protocols for LLM agents",
                         matched_topics=["LLM agents", "communication protocol"],
@@ -349,8 +366,28 @@ async def test_search_agent_executes_rewritten_query_after_weak_screening() -> N
         create_autospec(PaperSearchGateway, instance=True),
     )
     cast(AsyncMock, paper_search.search).side_effect = [
-        [make_paper("2401.00001")],
-        [make_paper("2401.00002")],
+        PaperSearchResult(
+            papers=[make_paper("2401.00001")],
+            provider=PaperSource.ARXIV,
+            attempts=[
+                PaperSearchAttempt(
+                    provider=PaperSource.ARXIV,
+                    status="completed",
+                    result_count=1,
+                )
+            ],
+        ),
+        PaperSearchResult(
+            papers=[make_paper("2401.00002")],
+            provider=PaperSource.ARXIV,
+            attempts=[
+                PaperSearchAttempt(
+                    provider=PaperSource.ARXIV,
+                    status="completed",
+                    result_count=1,
+                )
+            ],
+        ),
     ]
     recorder = cast(
         AgentExecutionRecorder,
@@ -358,7 +395,7 @@ async def test_search_agent_executes_rewritten_query_after_weak_screening() -> N
     )
     node = SearchAgentNode(
         model=model,
-        tool=ArxivSearchAgentTool(paper_search),
+        tool=AcademicPaperSearchAgentTool(paper_search),
         recorder=recorder,
         max_iterations=2,
     )
@@ -395,7 +432,7 @@ async def test_search_agent_executes_rewritten_query_after_weak_screening() -> N
         "large language model agent communication protocol",
     ]
     assert any(
-        item.arxiv_id == "2401.00002" and item.relevance is PaperRelevance.DIRECT
+        item.paper_id == "arxiv:2401.00002" and item.relevance is PaperRelevance.DIRECT
         for item in search_report.assessments
     )
     assert cast(AsyncMock, paper_search.search).await_count == 2
@@ -409,7 +446,7 @@ async def test_search_failure_is_visible_to_supervisor_and_stops_internal_loop()
     )
     cast(AsyncMock, model.generate_tool_call).return_value = ToolCallModelResult(
         call_id="rate-limited-call",
-        tool_name="search_arxiv",
+        tool_name="search_academic_papers",
         arguments={
             "query": "LLM agent collaboration",
             "max_results": 10,
@@ -435,7 +472,7 @@ async def test_search_failure_is_visible_to_supervisor_and_stops_internal_loop()
     )
     node = SearchAgentNode(
         model=model,
-        tool=ArxivSearchAgentTool(paper_search),
+        tool=AcademicPaperSearchAgentTool(paper_search),
         recorder=recorder,
         max_iterations=2,
     )
@@ -479,7 +516,7 @@ def test_reader_selects_requested_pdf_from_search_report() -> None:
         papers=[paper],
         assessments=[
             PaperAssessment(
-                arxiv_id=paper.arxiv_id,
+                paper_id=paper.paper_id,
                 relevance=PaperRelevance.DIRECT,
                 relevance_reason="Direct match",
                 matched_topics=["collaboration"],
@@ -500,7 +537,7 @@ def test_reader_selects_requested_pdf_from_search_report() -> None:
         content=report.model_dump_json(),
     )
 
-    selected = ReaderAgentNode._select_pdf_candidate([artifact], paper.arxiv_id)
+    selected = ReaderAgentNode._select_pdf_candidate([artifact], paper.paper_id)
 
     assert selected is not None
     assert selected.paper.arxiv_id == paper.arxiv_id
@@ -539,16 +576,25 @@ async def test_reader_receives_only_its_single_paper_scope() -> None:
             usage=ModelUsage(total_tokens=1),
         ),
         StructuredModelResult(
+            value=ReadingEvidenceAssessment(
+                evidence_sufficient=True,
+                coverage_summary="The metadata covers the focused objective",
+                covered_requirements=["Method summary from supplied metadata"],
+                missing_requirements=[],
+                retry_recommended=False,
+            ),
+            usage=ModelUsage(total_tokens=1),
+        ),
+        StructuredModelResult(
             value=ReadingReport(
-            paper_or_material=requested.title,
-            analysis_summary="Read the assigned paper",
-            answer_material="The paper uses a structured communication protocol.",
-            objective_satisfied=True,
-            answered_points=["Method"],
-            blocking_gaps=[],
-            evidence=[],
-            evidence_scope="Metadata only",
-            limitations=["One benchmark"],
+                paper_or_material=requested.title,
+                analysis_summary="Read the assigned paper",
+                objective_satisfied=True,
+                answered_points=["Method"],
+                blocking_gaps=[],
+                evidence=[],
+                evidence_scope="Metadata only",
+                limitations=["One benchmark"],
             ),
             usage=ModelUsage(total_tokens=3),
         ),
@@ -563,8 +609,9 @@ async def test_reader_receives_only_its_single_paper_scope() -> None:
         ),
         task=ReaderTask(
             objective="Summarize this paper's method",
+            depth=ReaderDepth.DEEP,
             source_artifact_id=source.id,
-            paper_id=requested.arxiv_id,
+            paper_id=requested.paper_id,
         ),
     )
 
@@ -582,7 +629,7 @@ async def test_reader_receives_only_its_single_paper_scope() -> None:
     messages = cast(AsyncMock, model.generate_structured).await_args.args[0]
     reader_input = str(messages[-1].content)
     assert "GLOBAL REQUEST" not in reader_input
-    assert requested.arxiv_id in reader_input
+    assert requested.paper_id in reader_input
     assert unrelated.arxiv_id not in reader_input
 
 
@@ -606,6 +653,7 @@ async def test_reader_retrieves_selected_local_paper_as_structured_evidence() ->
                 coverage_summary="The method evidence is covered",
                 covered_requirements=["Tree construction method"],
                 missing_requirements=[],
+                retry_recommended=False,
             ),
             usage=ModelUsage(total_tokens=2),
         ),
@@ -613,7 +661,6 @@ async def test_reader_retrieves_selected_local_paper_as_structured_evidence() ->
             value=ReadingReport(
                 paper_or_material="Local TreeRAG Paper",
                 analysis_summary="The retrieved method evidence was summarized",
-                answer_material="The paper builds a hierarchy-aware tree index.",
                 objective_satisfied=True,
                 answered_points=["Tree construction method"],
                 blocking_gaps=[],
@@ -658,6 +705,7 @@ async def test_reader_retrieves_selected_local_paper_as_structured_evidence() ->
         ),
         task=ReaderTask(
             objective="Summarize this paper's indexing method",
+            depth=ReaderDepth.DEEP,
             paper_id="local-paper",
         ),
     )
@@ -674,9 +722,7 @@ async def test_reader_retrieves_selected_local_paper_as_structured_evidence() ->
         ),
     )
 
-    reader_input = str(
-        cast(AsyncMock, model.generate_structured).await_args.args[0][-1].content
-    )
+    reader_input = str(cast(AsyncMock, model.generate_structured).await_args.args[0][-1].content)
     assert "ancestor titles as embedding prefixes" in reader_input
     assert '"page_start": 4' in reader_input
     summary = update["artifacts"][-1].supervisor_summary
@@ -689,12 +735,98 @@ async def test_reader_retrieves_selected_local_paper_as_structured_evidence() ->
 
 
 @pytest.mark.asyncio
+async def test_reader_searches_all_local_papers_without_preselecting_one() -> None:
+    model = cast(AgentModelGateway, create_autospec(AgentModelGateway, instance=True))
+    cast(AsyncMock, model.generate_structured).side_effect = [
+        StructuredModelResult(
+            value=ReadingEvidenceAssessment(
+                evidence_sufficient=True,
+                coverage_summary="The corpus contains direct evidence",
+                covered_requirements=["PDF parsing mitigation"],
+                missing_requirements=[],
+                retry_recommended=False,
+            ),
+            usage=ModelUsage(total_tokens=1),
+        ),
+        StructuredModelResult(
+            value=ReadingReport(
+                paper_or_material="Local paper corpus",
+                analysis_summary="PaperQA uses parsing fallbacks.",
+                objective_satisfied=True,
+                answered_points=["PDF parsing mitigation"],
+                blocking_gaps=[],
+                evidence=[],
+                evidence_scope="Globally retrieved local chunks",
+                limitations=[],
+            ),
+            usage=ModelUsage(total_tokens=1),
+        ),
+    ]
+    retriever = cast(TreeRagRetriever, create_autospec(TreeRagRetriever, instance=True))
+    cast(AsyncMock, retriever.retrieve).return_value = TreeRetrievalReport(
+        query="PDF parsing quality noisy retrieval text",
+        mode=RetrievalMode.METHOD,
+        paper_ids=[],
+        searched_globally=True,
+        candidate_paper_ids=["paperqa"],
+        initial_hit_count=1,
+        expanded_candidate_count=0,
+        hits=[
+            RetrievalHit(
+                rank=1,
+                node_id="paperqa:chunk:1",
+                paper_id="paperqa",
+                section_path=["Methods"],
+                page_start=3,
+                page_end=3,
+                text="Parsing fallback evidence",
+                vector_score=0.9,
+                ranking_score=0.9,
+                source=RetrievalSource.VECTOR,
+            )
+        ],
+    )
+    state = empty_state()
+    state["decision"] = SupervisorDecision(
+        assessment=DecisionAssessment(
+            observations=["The local corpus is available"],
+            missing_information=["Relevant evidence"],
+            decision_summary="Search all indexed papers",
+        ),
+        task=ReaderTask(
+            objective="Answer from the indexed corpus",
+            depth=ReaderDepth.QUICK,
+        ),
+    )
+
+    update = await ReaderAgentNode(model, paper_retriever=retriever)(
+        state,
+        Runtime(
+            context=AgentRunContext(
+                conversation_id=uuid4(),
+                run_id=uuid4(),
+                publisher=CapturingPublisher(),
+                local_corpus_available=True,
+            )
+        ),
+    )
+
+    retrieval_call = cast(AsyncMock, retriever.retrieve).await_args
+    assert retrieval_call.kwargs["paper_ids"] is None
+    assert retrieval_call.args[0] == "Answer from the indexed corpus"
+    judge_messages = cast(AsyncMock, model.generate_structured).await_args_list[0].args[0]
+    judge_input = str(judge_messages[-1].content)
+    assert '"reader_depth": "quick"' in judge_input
+    assert len(cast(AsyncMock, model.generate_structured).await_args_list) == 2
+    assert isinstance(update["decision"].task, WriterTask)
+
+
+@pytest.mark.asyncio
 async def test_reader_subgraph_rewrites_query_when_evidence_is_incomplete() -> None:
     model = cast(AgentModelGateway, create_autospec(AgentModelGateway, instance=True))
     reading_report = ReadingReport(
         paper_or_material="Local Paper",
         analysis_summary="Combined method and experiment evidence",
-        answer_material="Tree retrieval is evaluated on a benchmark and improves recall.",
         objective_satisfied=True,
         answered_points=["method", "experiments"],
         blocking_gaps=[],
@@ -719,6 +851,7 @@ async def test_reader_subgraph_rewrites_query_when_evidence_is_incomplete() -> N
                 coverage_summary="Method is covered but experiments are missing",
                 covered_requirements=["method"],
                 missing_requirements=["experiments"],
+                retry_recommended=True,
                 next_query="experimental setup datasets metrics results",
                 next_mode=RetrievalMode.SUMMARY,
             ),
@@ -730,6 +863,7 @@ async def test_reader_subgraph_rewrites_query_when_evidence_is_incomplete() -> N
                 coverage_summary="Method and experiments are now covered",
                 covered_requirements=["method", "experiments"],
                 missing_requirements=[],
+                retry_recommended=False,
             ),
             usage=ModelUsage(total_tokens=2),
         ),
@@ -795,6 +929,7 @@ async def test_reader_subgraph_rewrites_query_when_evidence_is_incomplete() -> N
         ),
         task=ReaderTask(
             objective="Summarize the method and experimental evaluation",
+            depth=ReaderDepth.DEEP,
             paper_id="local-paper",
         ),
     )
@@ -837,10 +972,19 @@ async def test_reader_skips_rag_when_metadata_already_answers_the_objective() ->
             usage=ModelUsage(total_tokens=2),
         ),
         StructuredModelResult(
+            value=ReadingEvidenceAssessment(
+                evidence_sufficient=True,
+                coverage_summary="Author metadata directly answers the question",
+                covered_requirements=["Paper authors"],
+                missing_requirements=[],
+                retry_recommended=False,
+            ),
+            usage=ModelUsage(total_tokens=1),
+        ),
+        StructuredModelResult(
             value=ReadingReport(
                 paper_or_material="Local Paper",
                 analysis_summary="The author question is answered by metadata",
-                answer_material="The authors are Ada Lovelace and Alan Turing.",
                 objective_satisfied=True,
                 answered_points=["Authors"],
                 blocking_gaps=[],
@@ -879,7 +1023,11 @@ async def test_reader_skips_rag_when_metadata_already_answers_the_objective() ->
             missing_information=["Authors"],
             decision_summary="Read the paper metadata",
         ),
-        task=ReaderTask(objective="Who are the authors?", paper_id="local-paper"),
+        task=ReaderTask(
+            objective="Who are the authors?",
+            depth=ReaderDepth.DEEP,
+            paper_id="local-paper",
+        ),
     )
 
     update = await ReaderAgentNode(
@@ -900,7 +1048,7 @@ async def test_reader_skips_rag_when_metadata_already_answers_the_objective() ->
 
     cast(AsyncMock, retriever.retrieve).assert_not_awaited()
     assert update["tool_calls"] == 0
-    assert update["llm_calls"] == 2
+    assert update["llm_calls"] == 3
 
 
 def test_supervisor_allows_reader_for_a_selected_local_paper() -> None:
@@ -912,6 +1060,7 @@ def test_supervisor_allows_reader_for_a_selected_local_paper() -> None:
         ),
         task=ReaderTask(
             objective="Read one local paper",
+            depth=ReaderDepth.DEEP,
             paper_id="local-paper",
         ),
     )
@@ -924,6 +1073,29 @@ def test_supervisor_allows_reader_for_a_selected_local_paper() -> None:
 
     assert isinstance(resolution.decision.task, ReaderTask)
     assert resolution.decision.task.paper_id == "local-paper"
+
+
+def test_supervisor_allows_global_reader_when_local_corpus_is_available() -> None:
+    decision = SupervisorDecision(
+        assessment=DecisionAssessment(
+            observations=["A local corpus is available"],
+            missing_information=["Relevant passages"],
+            decision_summary="Search the local corpus",
+        ),
+        task=ReaderTask(
+            objective="Find evidence without selecting a paper",
+            depth=ReaderDepth.QUICK,
+        ),
+    )
+
+    resolution = SupervisorNode._normalize_decision(
+        empty_state(),
+        decision,
+        local_corpus_available=True,
+    )
+
+    assert isinstance(resolution.decision.task, ReaderTask)
+    assert resolution.decision.task.paper_id is None
 
 
 def test_pdf_gateway_rejects_non_arxiv_urls() -> None:

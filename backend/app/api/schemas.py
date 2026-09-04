@@ -31,7 +31,6 @@ class SendMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     content: str = Field(min_length=1, max_length=10_000)
-    paper_ids: list[str] = Field(default_factory=list, max_length=20)
 
 
 class IndexedPaperResponse(BaseModel):
@@ -76,9 +75,13 @@ class PaperTreeNodeResponse(BaseModel):
     children_ids: list[str]
     level: int
     section_path: list[str]
+    semantic_role: str | None
+    block_types: list[str]
+    object_labels: list[str]
     page_start: int | None
     page_end: int | None
     text_preview: str
+    text: str
 
 
 class IndexedPaperDetailResponse(BaseModel):
@@ -100,7 +103,7 @@ class RetrievePaperRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(min_length=1, max_length=2_000)
-    paper_ids: list[str] = Field(min_length=1, max_length=20)
+    paper_ids: list[str] | None = Field(default=None, max_length=20)
     mode: RetrievalMode = RetrievalMode.FACT
 
 
@@ -109,6 +112,9 @@ class RetrievalHitResponse(BaseModel):
     node_id: str
     paper_id: str
     section_path: list[str]
+    semantic_role: str | None
+    block_types: list[str]
+    object_labels: list[str]
     page_start: int | None
     page_end: int | None
     text: str
@@ -126,6 +132,8 @@ class TreeRetrievalResponse(BaseModel):
     query: str
     mode: RetrievalMode
     paper_ids: list[str]
+    searched_globally: bool
+    candidate_paper_ids: list[str]
     initial_hit_count: int
     expanded_candidate_count: int
     hits: list[RetrievalHitResponse]
@@ -136,6 +144,8 @@ class TreeRetrievalResponse(BaseModel):
             query=report.query,
             mode=report.mode,
             paper_ids=report.paper_ids,
+            searched_globally=report.searched_globally,
+            candidate_paper_ids=report.candidate_paper_ids,
             initial_hit_count=report.initial_hit_count,
             expanded_candidate_count=report.expanded_candidate_count,
             hits=[RetrievalHitResponse.from_domain(hit) for hit in report.hits],

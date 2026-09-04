@@ -44,6 +44,10 @@ class _Library:
     async def list_papers(self) -> list[IndexedPaper]:
         return [self.paper]
 
+    async def delete_paper(self, paper_id: str) -> IndexedPaper:
+        assert paper_id == self.paper.paper_id
+        return self.paper
+
 
 def _client() -> TestClient:
     application = FastAPI()
@@ -69,3 +73,11 @@ def test_upload_and_list_papers_api() -> None:
     assert listed.status_code == 200
     assert listed.json()[0]["title"] == "Uploaded Paper"
     assert listed.json()[0]["authors"] == ["Ada Lovelace"]
+
+
+def test_delete_paper_api() -> None:
+    with _client() as client:
+        response = client.delete("/api/v1/papers/uploaded-abc123")
+
+    assert response.status_code == 204
+    assert response.content == b""

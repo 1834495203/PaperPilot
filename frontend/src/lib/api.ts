@@ -72,6 +72,16 @@ export function uploadPaper(file: File): Promise<IndexedPaper> {
   return requestJson<IndexedPaper>("/papers", { method: "POST", body });
 }
 
+export async function deleteIndexedPaper(paperId: string): Promise<void> {
+  const response = await fetch(
+    `${API_BASE_URL}/papers/${encodeURIComponent(paperId)}`,
+    { method: "DELETE" },
+  );
+  if (!response.ok) {
+    throw new ApiError(await response.text(), response.status);
+  }
+}
+
 export function getConversationMetrics(
   conversationId: string,
 ): Promise<ConversationMetricsResponse> {
@@ -110,7 +120,6 @@ export function listConversationEvents(
 export async function streamMessage(
   conversationId: string,
   content: string,
-  paperIds: string[],
   onEvent: (event: AgentEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -119,7 +128,7 @@ export async function streamMessage(
     {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({ content, paper_ids: paperIds }),
+      body: JSON.stringify({ content }),
       ...(signal === undefined ? {} : { signal }),
     },
   );

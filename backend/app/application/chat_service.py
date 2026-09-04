@@ -79,6 +79,8 @@ class ChatService:
         conversation_id: UUID,
         content: str,
         paper_ids: Sequence[str] = (),
+        *,
+        local_corpus_available: bool = False,
     ) -> AsyncIterator[AgentEvent]:
         await self._require_conversation(conversation_id)
         selected_paper_ids = tuple(dict.fromkeys(paper_ids))
@@ -105,6 +107,7 @@ class ChatService:
                 run_id=run.id,
                 publisher=publisher,
                 paper_ids=selected_paper_ids,
+                local_corpus_available=local_corpus_available,
             ),
             name=f"paperpilot-run-{run.id}",
         )
@@ -134,6 +137,7 @@ class ChatService:
         run_id: UUID,
         publisher: RunEventPublisher,
         paper_ids: tuple[str, ...],
+        local_corpus_available: bool,
     ) -> None:
         started = perf_counter()
         metrics_accumulated = False
@@ -150,6 +154,7 @@ class ChatService:
                     run_id=run_id,
                     publisher=publisher,
                     paper_ids=paper_ids,
+                    local_corpus_available=local_corpus_available,
                 ),
             )
             metrics = replace(metrics, duration_ms=int((perf_counter() - started) * 1000))

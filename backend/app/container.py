@@ -7,6 +7,7 @@ from app.application.paper_ingestion import PaperIngestionService
 from app.application.paper_library import PaperLibraryService
 from app.application.tree_retrieval import TreeRagRetriever
 from app.config import Settings
+from app.domain.papers import PaperSource
 from app.infrastructure.agent.supervisor.factory import create_supervisor_agent
 from app.infrastructure.db.store import SqlAlchemyConversationStore
 from app.infrastructure.rag.chroma_store import ChromaTreeVectorStore
@@ -14,19 +15,58 @@ from app.infrastructure.rag.embeddings import OpenAITextEmbeddingGateway
 from app.infrastructure.rag.pdf_parser import PypdfScientificPaperParser
 from app.infrastructure.rag.tree_chunker import TreeRagChunker
 from app.infrastructure.tools.arxiv import ArxivPaperSearchGateway
+from app.infrastructure.tools.openalex import OpenAlexPaperSearchGateway
+from app.infrastructure.tools.paper_search import (
+    FallbackPaperSearchGateway,
+    SearchProvider,
+)
 from app.infrastructure.tools.pdf import ArxivPdfDocumentGateway
+from app.infrastructure.tools.semantic_scholar import SemanticScholarPaperSearchGateway
 
 
 class ApplicationContainer:
     def __init__(self, settings: Settings) -> None:
         engine = create_async_engine(settings.database_url, pool_pre_ping=True)
         self.store = SqlAlchemyConversationStore(engine)
-        paper_search = ArxivPaperSearchGateway(
-            api_url=settings.arxiv_api_url,
-            timeout_seconds=settings.arxiv_timeout_seconds,
-            min_request_interval_seconds=settings.arxiv_min_request_interval_seconds,
-            max_retries=settings.arxiv_max_retries,
-            retry_backoff_seconds=settings.arxiv_retry_backoff_seconds,
+        paper_search = FallbackPaperSearchGateway(
+            [
+                SearchProvider(
+                    PaperSource.OPENALEX,
+                    OpenAlexPaperSearchGateway(
+                        api_url=settings.openalex_api_url,
+                        api_key=settings.openalex_api_key.get_secret_value(),
+                        timeout_seconds=settings.openalex_timeout_seconds,
+                        min_request_interval_seconds=(
+                            settings.openalex_min_request_interval_seconds
+                        ),
+                        max_retries=settings.openalex_max_retries,
+                        retry_backoff_seconds=settings.openalex_retry_backoff_seconds,
+                    ),
+                ),
+                SearchProvider(
+                    PaperSource.SEMANTIC_SCHOLAR,
+                    SemanticScholarPaperSearchGateway(
+                        api_url=settings.semantic_scholar_api_url,
+                        api_key=settings.semantic_scholar_api_key.get_secret_value(),
+                        timeout_seconds=settings.semantic_scholar_timeout_seconds,
+                        min_request_interval_seconds=(
+                            settings.semantic_scholar_min_request_interval_seconds
+                        ),
+                        max_retries=settings.semantic_scholar_max_retries,
+                        retry_backoff_seconds=(settings.semantic_scholar_retry_backoff_seconds),
+                    ),
+                ),
+                SearchProvider(
+                    PaperSource.ARXIV,
+                    ArxivPaperSearchGateway(
+                        api_url=settings.arxiv_api_url,
+                        timeout_seconds=settings.arxiv_timeout_seconds,
+                        min_request_interval_seconds=(settings.arxiv_min_request_interval_seconds),
+                        max_retries=settings.arxiv_max_retries,
+                        retry_backoff_seconds=settings.arxiv_retry_backoff_seconds,
+                    ),
+                ),
+            ]
         )
         paper_document = ArxivPdfDocumentGateway(
             timeout_seconds=settings.pdf_timeout_seconds,
@@ -52,6 +92,11 @@ class ApplicationContainer:
             max_expanded_per_hit=settings.retrieval_max_expanded_per_hit,
             max_candidates=settings.retrieval_max_candidates,
             max_chunks_per_paper=settings.retrieval_max_chunks_per_paper,
+            paper_top_k=settings.retrieval_paper_top_k,
+            sections_per_paper=settings.retrieval_sections_per_paper,
+            global_fallback_top_k=settings.retrieval_global_fallback_top_k,
+            min_ranking_score=settings.retrieval_min_ranking_score,
+            score_window=settings.retrieval_score_window,
         )
         paper_parser = PypdfScientificPaperParser()
         ingestion = PaperIngestionService(

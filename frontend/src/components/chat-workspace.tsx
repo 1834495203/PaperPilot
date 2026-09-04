@@ -18,6 +18,7 @@ import {
   cancelRun,
   createConversation,
   deleteConversation,
+  deleteIndexedPaper,
   getIndexedPaperDetail,
   getConversationMetrics,
   listConversationEvents,
@@ -79,8 +80,8 @@ export function ChatWorkspace() {
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [papers, setPapers] = useState<IndexedPaper[]>([]);
-  const [selectedPaperIds, setSelectedPaperIds] = useState<string[]>([]);
   const [isUploading, setIsUploading] = useState(false);
+  const [deletingPaperId, setDeletingPaperId] = useState<string | null>(null);
   const [paperDetail, setPaperDetail] = useState<IndexedPaperDetail | null>(null);
   const [loadingPaperId, setLoadingPaperId] = useState<string | null>(null);
   const metricsBaseline = useRef<RunMetrics>(EMPTY_METRICS);
@@ -302,7 +303,6 @@ export function ChatWorkspace() {
       await streamMessage(
         activeId,
         content,
-        selectedPaperIds,
         handleEvent,
         controller.signal,
       );
@@ -376,22 +376,11 @@ export function ChatWorkspace() {
     try {
       const paper = await uploadPaper(file);
       setPapers((current) => [paper, ...current.filter((item) => item.paper_id !== paper.paper_id)]);
-      setSelectedPaperIds((current) =>
-        current.includes(paper.paper_id) ? current : [...current, paper.paper_id],
-      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "论文上传失败");
     } finally {
       setIsUploading(false);
     }
-  };
-
-  const togglePaper = (paperId: string) => {
-    setSelectedPaperIds((current) =>
-      current.includes(paperId)
-        ? current.filter((item) => item !== paperId)
-        : [...current, paperId],
-    );
   };
 
   const viewPaper = async (paperId: string) => {
@@ -403,6 +392,31 @@ export function ChatWorkspace() {
       setError(caught instanceof Error ? caught.message : "读取论文索引失败");
     } finally {
       setLoadingPaperId(null);
+    }
+  };
+
+  const handleDeletePaper = async (paper: IndexedPaper) => {
+    if (
+      isRunning ||
+      deletingPaperId !== null ||
+      !window.confirm(
+        `删除论文“${paper.title}”？PDF、论文清单和全部向量索引都会被永久删除。`,
+      )
+    ) {
+      return;
+    }
+    setError(null);
+    setDeletingPaperId(paper.paper_id);
+    try {
+      await deleteIndexedPaper(paper.paper_id);
+      setPapers((current) => current.filter((item) => item.paper_id !== paper.paper_id));
+      setPaperDetail((current) =>
+        current?.paper.paper_id === paper.paper_id ? null : current
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "删除论文失败");
+    } finally {
+      setDeletingPaperId(null);
     }
   };
 
@@ -429,16 +443,10 @@ export function ChatWorkspace() {
               type="file"
             />
           </label>
-          <div className="indexed-papers">
+          <div className="indexed-papers hidden-scrollbar">
             {papers.map((paper) => (
               <div className="indexed-paper" key={paper.paper_id}>
-                <input
-                  aria-label={`选择 ${paper.title} 用于问答`}
-                  checked={selectedPaperIds.includes(paper.paper_id)}
-                  onChange={() => togglePaper(paper.paper_id)}
-                  type="checkbox"
-                />
-                <button onClick={() => void viewPaper(paper.paper_id)} type="button">
+                <button className="paper-open" onClick={() => void viewPaper(paper.paper_id)} type="button">
                   <strong>{paper.title}</strong>
                   <small>
                     {loadingPaperId === paper.paper_id
@@ -448,11 +456,19 @@ export function ChatWorkspace() {
                         : `${paper.page_count} 页 · ${paper.chunk_count} chunks`}
                   </small>
                 </button>
+                <button
+                  aria-label={`删除论文 ${paper.title}`}
+                  className="delete-paper"
+                  disabled={isRunning || deletingPaperId !== null}
+                  onClick={() => void handleDeletePaper(paper)}
+                  title="删除论文及向量索引"
+                  type="button"
+                >{deletingPaperId === paper.paper_id ? "…" : "×"}</button>
               </div>
             ))}
           </div>
         </section>
-        <nav aria-label="对话列表">
+        <nav aria-label="对话列表" className="conversation-list hidden-scrollbar">
           {conversations.map((conversation) => (
             <div className="conversation-row" key={conversation.id}>
               <button
@@ -480,7 +496,7 @@ export function ChatWorkspace() {
           <div><span className={isRunning ? "status running" : "status"} /> Supervisor Research Team</div>
           <span>{isRunning ? "执行中" : "Ready"}</span>
         </header>
-        <div className="messages">
+        <div className="messages hidden-scrollbar">
           {renderedMessages.length === 0 ? (
             <div className="hero">
               <span>ARXIV RESEARCH WORKSPACE</span>
@@ -528,13 +544,19 @@ export function ChatWorkspace() {
         </form>
       </section>
 
-      <aside className="trace-column">
+      <aside className="trace-column hidden-scrollbar">
         <div className="section-heading"><h2>会话累计</h2></div>
         <MetricsPanel metrics={metrics} />
         <EventTimeline events={latestRunEvents} />
       </aside>
       {paperDetail !== null ? (
-        <PaperDetailPanel detail={paperDetail} onClose={() => setPaperDetail(null)} />
+        <PaperDetailPanel
+          deleteDisabled={isRunning || deletingPaperId !== null}
+          detail={paperDetail}
+          isDeleting={deletingPaperId === paperDetail.paper.paper_id}
+          onClose={() => setPaperDetail(null)}
+          onDelete={() => void handleDeletePaper(paperDetail.paper)}
+        />
       ) : null}
     </main>
   );

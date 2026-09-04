@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.domain.papers import Paper
+from app.domain.papers import Paper, PaperSource
 from app.domain.rag import RetrievalMode
 
 
@@ -53,11 +53,16 @@ class DecisionSource(StrEnum):
     EXTERNAL = "external"
 
 
+class ReaderDepth(StrEnum):
+    QUICK = "quick"
+    DEEP = "deep"
+
+
 class DecisionAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    observations: list[str]
-    missing_information: list[str]
+    observations: list[str] = Field(max_length=6)
+    missing_information: list[str] = Field(max_length=4)
     decision_summary: str = Field(min_length=1, max_length=500)
 
 
@@ -75,8 +80,9 @@ class SearchTask(AgentTaskBase):
 
 class ReaderTask(AgentTaskBase):
     agent: Literal[AgentName.READER] = AgentName.READER
+    depth: ReaderDepth
     source_artifact_id: UUID | None = None
-    paper_id: str = Field(min_length=1)
+    paper_id: str | None = Field(default=None, min_length=1)
 
 
 class ReadingPlan(BaseModel):
@@ -104,17 +110,19 @@ class ReadingEvidenceAssessment(BaseModel):
     coverage_summary: str = Field(min_length=1, max_length=1_000)
     covered_requirements: list[str] = Field(max_length=8)
     missing_requirements: list[str] = Field(max_length=8)
+    retry_recommended: bool
     next_query: str | None = Field(default=None, min_length=2, max_length=2_000)
     next_mode: RetrievalMode | None = None
 
     @model_validator(mode="after")
     def require_retry_plan_when_insufficient(self) -> Self:
-        if not self.evidence_sufficient and (
-            self.next_query is None or self.next_mode is None
-        ):
-            raise ValueError(
-                "next_query and next_mode are required when evidence is insufficient"
-            )
+        if self.evidence_sufficient and self.retry_recommended:
+            raise ValueError("retry_recommended must be false when evidence is sufficient")
+        if self.retry_recommended and (self.next_query is None or self.next_mode is None):
+            raise ValueError("next_query and next_mode are required when evidence is insufficient")
+        has_retry_parameters = self.next_query is not None or self.next_mode is not None
+        if not self.retry_recommended and has_retry_parameters:
+            raise ValueError("next_query and next_mode require retry_recommended=true")
         return self
 
 
@@ -153,8 +161,7 @@ class ReadingReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     paper_or_material: str
-    analysis_summary: str = Field(min_length=1, max_length=1_000)
-    answer_material: str = Field(min_length=1, max_length=8_000)
+    analysis_summary: str = Field(min_length=1, max_length=8_000)
     objective_satisfied: bool
     answered_points: list[str] = Field(max_length=12)
     blocking_gaps: list[str] = Field(max_length=8)
@@ -166,7 +173,7 @@ class ReadingReport(BaseModel):
 class PaperAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    arxiv_id: str
+    paper_id: str
     relevance: PaperRelevance
     relevance_reason: str
     matched_topics: list[str]
@@ -222,7 +229,8 @@ class AnalysisReport(BaseModel):
 class SearchPaperSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    arxiv_id: str
+    paper_id: str
+    source: PaperSource
     title: str
     relevance: PaperRelevance
     relevance_reason: str

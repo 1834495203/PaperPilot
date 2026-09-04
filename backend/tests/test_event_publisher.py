@@ -43,7 +43,7 @@ async def test_persisted_tool_event_uses_compact_payload() -> None:
     )
     payload: dict[str, JsonValue] = {
         "tool_call_id": "call-1",
-        "tool_name": "search_arxiv",
+        "tool_name": "search_academic_papers",
         "result_count": 1,
         "duration_ms": 50,
         "papers": [{"title": "Large payload"}],

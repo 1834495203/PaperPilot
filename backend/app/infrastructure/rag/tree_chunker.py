@@ -2,7 +2,15 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from app.domain.rag import PageTextBlock, ParsedPaperDocument, TreeIndexNode, TreeNodeType
+from app.domain.rag import (
+    DocumentBlock,
+    PageTextBlock,
+    PaperBlockType,
+    PaperSection,
+    ParsedPaperDocument,
+    TreeIndexNode,
+    TreeNodeType,
+)
 
 
 @dataclass(slots=True)
@@ -14,6 +22,9 @@ class _MutableNode:
     parent_id: str | None
     level: int
     section_path: list[str]
+    semantic_role: str | None
+    block_types: list[PaperBlockType]
+    object_labels: list[str]
     text: str
     embedding_text: str
     page_start: int | None
@@ -30,6 +41,9 @@ class _MutableNode:
             children_ids=self.children_ids,
             level=self.level,
             section_path=self.section_path,
+            semantic_role=self.semantic_role,
+            block_types=self.block_types,
+            object_labels=self.object_labels,
             text=self.text,
             embedding_text=self.embedding_text,
             page_start=self.page_start,
@@ -41,6 +55,8 @@ class _MutableNode:
 class _TextUnit:
     page_number: int
     text: str
+    block_type: PaperBlockType
+    object_label: str | None = None
 
 
 class TreeRagChunker:
@@ -53,6 +69,7 @@ class TreeRagChunker:
 
     def chunk(self, document: ParsedPaperDocument) -> list[TreeIndexNode]:
         root_id = f"{document.paper_id}:root"
+        root_embedding_text = self._root_embedding_text(document)
         mutable_nodes: dict[str, _MutableNode] = {
             root_id: _MutableNode(
                 node_id=root_id,
@@ -62,8 +79,11 @@ class TreeRagChunker:
                 parent_id=None,
                 level=0,
                 section_path=[],
+                semantic_role=None,
+                block_types=[],
+                object_labels=[],
                 text=document.title,
-                embedding_text=document.title,
+                embedding_text=root_embedding_text,
                 page_start=1,
                 page_end=document.page_count,
             )
@@ -89,7 +109,7 @@ class TreeRagChunker:
         for section in document.sections:
             path = section_path(section.section_id)
             parent_id = section.parent_section_id or root_id
-            embedding_text = self._prefixed_text(document.title, path, "")
+            embedding_text = self._section_embedding_text(document.title, path, section)
             mutable_nodes[section.section_id] = _MutableNode(
                 node_id=section.section_id,
                 paper_id=document.paper_id,
@@ -98,6 +118,9 @@ class TreeRagChunker:
                 parent_id=parent_id,
                 level=section.level,
                 section_path=path,
+                semantic_role=section.semantic_role,
+                block_types=[],
+                object_labels=[],
                 text=section.title,
                 embedding_text=embedding_text,
                 page_start=section.page_start,
@@ -109,6 +132,12 @@ class TreeRagChunker:
                 node_id = f"{section.section_id}:chunk:{index:04d}"
                 text = "\n\n".join(unit.text for unit in units)
                 pages = [unit.page_number for unit in units]
+                block_types = list(dict.fromkeys(unit.block_type for unit in units))
+                object_labels = list(
+                    dict.fromkeys(
+                        unit.object_label for unit in units if unit.object_label is not None
+                    )
+                )
                 path = section_path(section.section_id)
                 mutable_nodes[node_id] = _MutableNode(
                     node_id=node_id,
@@ -118,6 +147,9 @@ class TreeRagChunker:
                     parent_id=section.section_id,
                     level=section.level + 1,
                     section_path=path,
+                    semantic_role=section.semantic_role,
+                    block_types=block_types,
+                    object_labels=object_labels,
                     text=text,
                     embedding_text=self._prefixed_text(document.title, path, text),
                     page_start=min(pages),
@@ -129,21 +161,43 @@ class TreeRagChunker:
                 mutable_nodes[node.parent_id].children_ids.append(node.node_id)
         return [node.freeze() for node in mutable_nodes.values()]
 
-    def _section_chunks(self, blocks: Sequence[PageTextBlock]) -> list[list[_TextUnit]]:
+    def _section_chunks(self, blocks: Sequence[DocumentBlock]) -> list[list[_TextUnit]]:
         units: list[_TextUnit] = []
         for block in blocks:
             page_number = block.page_number
             block_text = block.text
+            object_label = getattr(block, "object_label", None)
+            if not isinstance(block, PageTextBlock):
+                units.append(
+                    _TextUnit(
+                        page_number=page_number,
+                        text=block_text,
+                        block_type=block.block_type,
+                        object_label=object_label,
+                    )
+                )
+                continue
             paragraphs = [item.strip() for item in block_text.split("\n\n") if item.strip()]
             for paragraph in paragraphs:
                 units.extend(
-                    _TextUnit(page_number=page_number, text=part)
+                    _TextUnit(
+                        page_number=page_number,
+                        text=part,
+                        block_type=block.block_type,
+                    )
                     for part in self._split_long_text(paragraph)
                 )
         packed: list[list[_TextUnit]] = []
         current: list[_TextUnit] = []
         current_length = 0
         for unit in units:
+            if unit.block_type is not PaperBlockType.TEXT:
+                if current:
+                    packed.append(current)
+                    current = []
+                    current_length = 0
+                packed.append([unit])
+                continue
             separator_length = 2 if current else 0
             if (
                 current
@@ -198,3 +252,40 @@ class TreeRagChunker:
     def _prefixed_text(paper_title: str, section_path: list[str], text: str) -> str:
         # TreeRAG Equation (1): ancestor title content is concatenated before the node text.
         return "\n".join([paper_title, *section_path, text]).strip()
+
+    @staticmethod
+    def _root_embedding_text(document: ParsedPaperDocument) -> str:
+        parts = [document.title]
+        if document.metadata.abstract:
+            parts.append(f"Abstract: {document.metadata.abstract}")
+        if document.metadata.keywords:
+            parts.append(f"Keywords: {', '.join(document.metadata.keywords)}")
+        outline = [
+            f"{section.index} {section.title}" if section.index else section.title
+            for section in document.sections
+        ]
+        if outline:
+            parts.append("Sections: " + "; ".join(outline))
+        return "\n".join(parts)
+
+    @classmethod
+    def _section_embedding_text(
+        cls,
+        paper_title: str,
+        section_path: list[str],
+        section: PaperSection,
+    ) -> str:
+        # The section vector is a routing summary, while the original section title
+        # remains unchanged for display and citation.
+        representative = "\n".join(
+            block.text.strip() for block in section.blocks
+        ).strip()
+        representative = representative[:1_500]
+        role_text = (
+            f"Semantic role: {section.semantic_role}" if section.semantic_role else ""
+        )
+        return cls._prefixed_text(
+            paper_title,
+            section_path,
+            "\n".join(item for item in (role_text, representative) if item),
+        )

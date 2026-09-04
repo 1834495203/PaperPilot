@@ -48,6 +48,11 @@ async def _run() -> None:
         max_expanded_per_hit=settings.retrieval_max_expanded_per_hit,
         max_candidates=settings.retrieval_max_candidates,
         max_chunks_per_paper=settings.retrieval_max_chunks_per_paper,
+        paper_top_k=settings.retrieval_paper_top_k,
+        sections_per_paper=settings.retrieval_sections_per_paper,
+        global_fallback_top_k=settings.retrieval_global_fallback_top_k,
+        min_ranking_score=settings.retrieval_min_ranking_score,
+        score_window=settings.retrieval_score_window,
     )
     report = await retriever.retrieve(
         args.query,

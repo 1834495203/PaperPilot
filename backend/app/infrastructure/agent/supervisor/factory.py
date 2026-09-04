@@ -4,7 +4,7 @@ from app.application.paper_library import PaperLibraryService
 from app.application.tree_retrieval import TreeRagRetriever
 from app.domain.ports import ConversationStore, PaperDocumentGateway, PaperSearchGateway
 from app.infrastructure.agent.recording import AgentExecutionRecorder
-from app.infrastructure.agent.search.tools import ArxivSearchAgentTool
+from app.infrastructure.agent.search.tools import AcademicPaperSearchAgentTool
 from app.infrastructure.agent.supervisor.analyst_agent import AnalystAgentNode
 from app.infrastructure.agent.supervisor.builder import SupervisorGraphBuilder
 from app.infrastructure.agent.supervisor.graph import SupervisorAgentGraph
@@ -33,7 +33,7 @@ def create_supervisor_agent(
         supervisor=SupervisorNode(model_gateway, max_steps=max_steps),
         search=SearchAgentNode(
             model=model_gateway,
-            tool=ArxivSearchAgentTool(paper_search),
+            tool=AcademicPaperSearchAgentTool(paper_search),
             recorder=recorder,
             max_iterations=search_max_iterations,
         ),

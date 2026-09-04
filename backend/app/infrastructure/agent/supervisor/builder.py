@@ -13,6 +13,7 @@ from app.infrastructure.agent.supervisor.supervisor_node import SupervisorNode
 from app.infrastructure.agent.supervisor.writer_agent import WriterAgentNode
 
 RouteName = Literal["search", "reader", "analyst", "writer"]
+ReaderExitRoute = Literal["supervisor", "writer"]
 
 
 class SupervisorGraphBuilder:
@@ -57,7 +58,11 @@ class SupervisorGraphBuilder:
             },
         )
         builder.add_edge("search", "supervisor")
-        builder.add_edge("reader", "supervisor")
+        builder.add_conditional_edges(
+            "reader",
+            self._route_after_reader,
+            {"supervisor": "supervisor", "writer": "writer"},
+        )
         builder.add_edge("analyst", "supervisor")
         builder.add_edge("writer", END)
         return builder.compile()
@@ -68,3 +73,10 @@ class SupervisorGraphBuilder:
         if decision is None:
             raise ValueError("Supervisor must produce a routing decision")
         return decision.task.agent.value
+
+    @staticmethod
+    def _route_after_reader(state: SupervisorState) -> ReaderExitRoute:
+        decision = state["decision"]
+        if decision is not None and decision.task.agent is AgentName.WRITER:
+            return "writer"
+        return "supervisor"

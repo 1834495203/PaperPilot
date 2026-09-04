@@ -8,11 +8,11 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from app.application.agent import AgentRunContext
 from app.domain.enums import EventType
-from app.domain.papers import Paper
+from app.domain.papers import Paper, PaperSearchAttempt, PaperSearchResult, PaperSource
 from app.domain.ports import EventPublisher, PaperSearchGateway
 from app.domain.types import JsonValue
 from app.infrastructure.agent.recording import AgentExecutionRecorder
-from app.infrastructure.agent.search.tools import ArxivSearchAgentTool
+from app.infrastructure.agent.search.tools import AcademicPaperSearchAgentTool
 from app.infrastructure.agent.supervisor.analyst_agent import AnalystAgentNode
 from app.infrastructure.agent.supervisor.builder import SupervisorGraphBuilder
 from app.infrastructure.agent.supervisor.model_gateway import (
@@ -80,7 +80,7 @@ async def test_supervisor_routes_search_result_back_to_writer() -> None:
                 screening_summary="The returned paper directly matches the topic",
                 assessments=[
                     PaperAssessment(
-                        arxiv_id="2401.00001",
+                        paper_id="arxiv:2401.00001",
                         relevance=PaperRelevance.DIRECT,
                         relevance_reason="It evaluates hallucinations in RAG",
                         matched_topics=["RAG", "hallucination evaluation"],
@@ -105,7 +105,7 @@ async def test_supervisor_routes_search_result_back_to_writer() -> None:
     tool_call = cast(AsyncMock, model.generate_tool_call)
     tool_call.return_value = ToolCallModelResult(
         call_id="call-1",
-        tool_name="search_arxiv",
+        tool_name="search_academic_papers",
         arguments={
             "query": "retrieval augmented generation hallucination evaluation",
             "max_results": 3,
@@ -129,20 +129,32 @@ async def test_supervisor_routes_search_result_back_to_writer() -> None:
         PaperSearchGateway,
         create_autospec(PaperSearchGateway, instance=True),
     )
-    cast(AsyncMock, paper_search.search).return_value = [
-        Paper.model_validate(
-            {
-                "arxiv_id": "2401.00001",
-                "title": "Evaluating Hallucinations in RAG",
-                "summary": "A grounded evaluation study.",
-                "authors": ["Ada Example"],
-                "published_at": datetime.now(UTC),
-                "updated_at": datetime.now(UTC),
-                "abstract_url": "https://arxiv.org/abs/2401.00001",
-                "pdf_url": "https://arxiv.org/pdf/2401.00001",
-            }
-        )
-    ]
+    paper = Paper.model_validate(
+        {
+            "paper_id": "arxiv:2401.00001",
+            "source": "arxiv",
+            "arxiv_id": "2401.00001",
+            "external_ids": {"arxiv": "2401.00001"},
+            "title": "Evaluating Hallucinations in RAG",
+            "summary": "A grounded evaluation study.",
+            "authors": ["Ada Example"],
+            "published_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
+            "landing_page_url": "https://arxiv.org/abs/2401.00001",
+            "pdf_url": "https://arxiv.org/pdf/2401.00001",
+        }
+    )
+    cast(AsyncMock, paper_search.search).return_value = PaperSearchResult(
+        papers=[paper],
+        provider=PaperSource.ARXIV,
+        attempts=[
+            PaperSearchAttempt(
+                provider=PaperSource.ARXIV,
+                status="completed",
+                result_count=1,
+            )
+        ],
+    )
     recorder = cast(
         AgentExecutionRecorder,
         create_autospec(AgentExecutionRecorder, instance=True),
@@ -150,14 +162,14 @@ async def test_supervisor_routes_search_result_back_to_writer() -> None:
     cast(AsyncMock, recorder.record_tool_execution).return_value = ToolMessage(
         content="[]",
         tool_call_id="call-1",
-        name="search_arxiv",
+        name="search_academic_papers",
     )
     cast(AsyncMock, recorder.record_assistant_message).return_value = uuid4()
     graph = SupervisorGraphBuilder(
         supervisor=SupervisorNode(model, max_steps=6),
         search=SearchAgentNode(
             model=model,
-            tool=ArxivSearchAgentTool(paper_search),
+            tool=AcademicPaperSearchAgentTool(paper_search),
             recorder=recorder,
         ),
         reader=ReaderAgentNode(model),
@@ -206,14 +218,11 @@ async def test_supervisor_routes_search_result_back_to_writer() -> None:
     supervisor_decisions = [
         payload
         for event_type, payload in publisher.events
-        if event_type == EventType.DECISION_RECORDED.value
-        and payload.get("actor") == "supervisor"
+        if event_type == EventType.DECISION_RECORDED.value and payload.get("actor") == "supervisor"
     ]
     assert supervisor_decisions[0]["source"] == DecisionSource.MODEL.value
     assert supervisor_decisions[0]["next_agent"] == AgentName.SEARCH.value
-    assert supervisor_decisions[0]["observations"] == [
-        "The user asks for an external paper"
-    ]
+    assert supervisor_decisions[0]["observations"] == ["The user asks for an external paper"]
 
 
 def test_supervisor_keeps_model_decision_separate_from_policy_override() -> None:

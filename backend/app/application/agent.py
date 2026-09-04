@@ -15,6 +15,7 @@ class AgentRunContext:
     run_id: UUID
     publisher: EventPublisher
     paper_ids: tuple[str, ...] = ()
+    local_corpus_available: bool = False
 
 
 class AgentRunner(ABC):

@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import json
 import re
+from contextlib import suppress
 from pathlib import Path
+from uuid import uuid4
 
 from app.application.paper_ingestion import PaperIngestionService
 from app.application.tree_retrieval import TreeRagRetriever
@@ -125,9 +127,13 @@ class PaperLibraryService:
                     children_ids=item.node.children_ids,
                     level=item.node.level,
                     section_path=item.node.section_path,
+                    semantic_role=item.node.semantic_role,
+                    block_types=item.node.block_types,
+                    object_labels=item.node.object_labels,
                     page_start=item.node.page_start,
                     page_end=item.node.page_end,
                     text_preview=self._preview(item.node.text),
+                    text=item.node.text,
                 )
                 for item in indexed_nodes
             ),
@@ -139,15 +145,43 @@ class PaperLibraryService:
         )
         return IndexedPaperDetail(paper=paper, nodes=nodes)
 
+    async def delete_paper(self, paper_id: str) -> IndexedPaper:
+        """Delete one paper's vector nodes, manifest, and managed PDF as one operation."""
+        if self._vector_store is None:
+            raise RuntimeError("Paper tree index writer is not configured")
+        async with self._lock:
+            paper = await self.get_paper(paper_id)
+            sources = [
+                self._manifest_path(paper.paper_id),
+                self._library_path / f"{paper.paper_id}.pdf",
+            ]
+            token = uuid4().hex
+            staged: list[tuple[Path, Path]] = []
+            try:
+                for source in sources:
+                    if not source.exists():
+                        continue
+                    temporary = source.with_name(f".{source.name}.{token}.deleting")
+                    await asyncio.to_thread(source.replace, temporary)
+                    staged.append((source, temporary))
+                await self._vector_store.delete_paper(paper.paper_id)
+            except Exception:
+                for source, temporary in reversed(staged):
+                    if temporary.exists():
+                        await asyncio.to_thread(temporary.replace, source)
+                raise
+            await asyncio.to_thread(self._remove_staged_files, staged)
+            return paper
+
     async def retrieve(
         self,
         query: str,
         *,
-        paper_ids: list[str],
+        paper_ids: list[str] | None = None,
         mode: RetrievalMode,
     ) -> TreeRetrievalReport:
         known_ids = {paper.paper_id for paper in await self.list_papers()}
-        missing = [paper_id for paper_id in paper_ids if paper_id not in known_ids]
+        missing = [paper_id for paper_id in (paper_ids or []) if paper_id not in known_ids]
         if missing:
             raise PaperNotFoundError(", ".join(missing))
         return await self._retriever.retrieve(query, paper_ids=paper_ids, mode=mode)
@@ -163,6 +197,12 @@ class PaperLibraryService:
 
     def _manifest_path(self, paper_id: str) -> Path:
         return self._library_path / f"{paper_id}.json"
+
+    @staticmethod
+    def _remove_staged_files(staged: list[tuple[Path, Path]]) -> None:
+        for _, temporary in staged:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
 
     async def _backfill_legacy_metadata(self) -> None:
         """Upgrade pre-metadata manifests without rebuilding vector embeddings."""

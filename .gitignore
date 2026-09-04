@@ -17,3 +17,7 @@ frontend/out/
 /backend/data/chroma/
 /backend/data/papers/
 /backend/paper/*.pdf
+
+# Personal documents must stay local.
+/*简历*.docx
+/~$*.docx

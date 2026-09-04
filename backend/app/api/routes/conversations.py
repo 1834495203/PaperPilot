@@ -144,22 +144,14 @@ async def stream_message(
     service: Annotated[ChatService, Depends(get_chat_service)],
     paper_library: Annotated[PaperLibraryService, Depends(get_paper_library)],
 ) -> StreamingResponse:
-    known_paper_ids = {paper.paper_id for paper in await paper_library.list_papers()}
-    missing_paper_ids = [
-        paper_id for paper_id in request.paper_ids if paper_id not in known_paper_ids
-    ]
-    if missing_paper_ids:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Indexed papers not found: {', '.join(missing_paper_ids)}",
-        )
+    local_corpus_available = bool(await paper_library.list_papers())
 
     async def event_stream() -> AsyncIterator[str]:
         try:
             async for event in service.stream_message(
                 conversation_id,
                 request.content,
-                request.paper_ids,
+                local_corpus_available=local_corpus_available,
             ):
                 response = EventResponse.from_domain(event)
                 data = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)

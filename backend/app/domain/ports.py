@@ -11,11 +11,12 @@ from app.domain.entities import (
     RunMetrics,
 )
 from app.domain.enums import MessageRole, RunStatus
-from app.domain.papers import ArxivSearchInput, Paper, PdfDocument
+from app.domain.papers import PaperSearchInput, PaperSearchResult, PdfDocument
 from app.domain.rag import (
     IndexedTreeNode,
     ParsedPaperDocument,
     TreeIndexNode,
+    TreeNodeType,
     TreeVectorMatch,
 )
 from app.domain.types import JsonValue
@@ -100,7 +101,7 @@ class ConversationStore(ABC):
 
 class PaperSearchGateway(ABC):
     @abstractmethod
-    async def search(self, search_input: ArxivSearchInput) -> Sequence[Paper]: ...
+    async def search(self, search_input: PaperSearchInput) -> PaperSearchResult: ...
 
 
 class PaperDocumentGateway(ABC):
@@ -141,13 +142,18 @@ class TreeVectorStore(ABC):
     ) -> None: ...
 
     @abstractmethod
+    async def delete_paper(self, paper_id: str) -> None: ...
+
+    @abstractmethod
     async def similarity_search(
         self,
         query_embedding: Sequence[float],
         *,
-        paper_ids: Sequence[str],
+        paper_ids: Sequence[str] | None,
         top_k: int,
         chunks_only: bool,
+        node_types: Sequence[TreeNodeType] | None = None,
+        parent_ids: Sequence[str] | None = None,
     ) -> list[TreeVectorMatch]: ...
 
     @abstractmethod
