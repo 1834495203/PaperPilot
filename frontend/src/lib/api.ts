@@ -1,8 +1,10 @@
 import type {
   AgentEvent,
   AgentRun,
+  Citation,
   Conversation,
   ConversationMetricsResponse,
+  JsonValue,
   Message,
   IndexedPaper,
   IndexedPaperDetail,
@@ -66,6 +68,35 @@ export function getIndexedPaperDetail(paperId: string): Promise<IndexedPaperDeta
   });
 }
 
+export function assetUrl(paperId: string, filename: string): string {
+  return `${API_BASE_URL}/papers/${encodeURIComponent(paperId)}/assets/${encodeURIComponent(filename)}`;
+}
+
+export function pdfUrl(paperId: string): string {
+  return `${API_BASE_URL}/papers/${encodeURIComponent(paperId)}/pdf`;
+}
+
+function toCitation(value: JsonValue): Citation | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, JsonValue>;
+  if (typeof record.evidence_id !== "string" || typeof record.paper_id !== "string") return null;
+  return {
+    evidence_id: record.evidence_id,
+    paper_id: record.paper_id,
+    paper_title: typeof record.paper_title === "string" ? record.paper_title : "",
+    page_start: typeof record.page_start === "number" ? record.page_start : null,
+    page_end: typeof record.page_end === "number" ? record.page_end : null,
+    excerpt: typeof record.excerpt === "string" ? record.excerpt : "",
+    spans: [],
+  };
+}
+
+export function readCitations(message: Message): Citation[] {
+  const raw = message.metadata?.citations;
+  if (!Array.isArray(raw)) return [];
+  return raw.map(toCitation).filter((item): item is Citation => item !== null);
+}
+
 export function uploadPaper(file: File): Promise<IndexedPaper> {
   const body = new FormData();
   body.append("file", file);
@@ -117,21 +148,16 @@ export function listConversationEvents(
   );
 }
 
-export async function streamMessage(
-  conversationId: string,
-  content: string,
+async function streamEvents(
+  path: string,
+  init: RequestInit,
   onEvent: (event: AgentEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/conversations/${conversationId}/messages/stream`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({ content }),
-      ...(signal === undefined ? {} : { signal }),
-    },
-  );
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...init,
+    ...(signal === undefined ? {} : { signal }),
+  });
   if (!response.ok || response.body === null) {
     throw new ApiError(await response.text(), response.status);
   }
@@ -154,4 +180,36 @@ export async function streamMessage(
       }
     }
   }
+}
+
+export async function streamMessage(
+  conversationId: string,
+  content: string,
+  onEvent: (event: AgentEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  await streamEvents(
+    `/conversations/${conversationId}/messages/stream`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+      body: JSON.stringify({ content }),
+    },
+    onEvent,
+    signal,
+  );
+}
+
+export async function regenerateMessage(
+  conversationId: string,
+  messageId: string,
+  onEvent: (event: AgentEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  await streamEvents(
+    `/conversations/${conversationId}/messages/${messageId}/regenerate`,
+    { method: "POST", headers: { Accept: "text/event-stream" } },
+    onEvent,
+    signal,
+  );
 }

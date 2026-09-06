@@ -44,7 +44,7 @@ class StubJsonModel:
 
 
 @pytest.mark.asyncio
-async def test_structured_generation_uses_json_mode_and_specific_repair_feedback() -> None:
+async def test_structured_generation_uses_tool_calling_and_specific_repair_feedback() -> None:
     model = StubJsonModel(
         [
             AIMessage(content='{"answer":"first" "confidence":1}'),
@@ -59,10 +59,11 @@ async def test_structured_generation_uses_json_mode_and_specific_repair_feedback
     )
 
     assert result.value.answer == "repaired"
-    assert model.bind_options == {"response_format": {"type": "json_object"}}
+    assert model.bind_options == {}
+    assert len(model.bound_tools) == 1
     repair_prompt = str(model.calls[1][-1].content)
     assert "json_invalid" in repair_prompt
-    assert "Rebuild the entire object from scratch" in repair_prompt
+    assert "Return exactly one valid tool call" in repair_prompt
 
 
 @pytest.mark.asyncio

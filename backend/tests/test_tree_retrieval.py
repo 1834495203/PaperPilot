@@ -2,8 +2,8 @@ from collections.abc import Sequence
 
 import pytest
 
-from app.application.tree_retrieval import TreeRagRetriever
-from app.domain.ports import TextEmbeddingGateway, TreeVectorStore
+from app.application.tree_retrieval import TreeRagRetriever, _Candidate
+from app.domain.ports import TextEmbeddingGateway, TextRerankerGateway, TreeVectorStore
 from app.domain.rag import (
     IndexedTreeNode,
     ParsedPaperDocument,
@@ -46,6 +46,23 @@ class _Embedder(TextEmbeddingGateway):
 
     async def embed_query(self, text: str) -> list[float]:
         return [1.0, 0.0]
+
+
+class _Reranker(TextRerankerGateway):
+    def __init__(self, scores: list[float], *, error: str | None = None) -> None:
+        self.scores = scores
+        self.error = error
+
+    @property
+    def name(self) -> str:
+        return "test-cross-encoder"
+
+    async def rerank(self, query: str, documents: Sequence[str]) -> list[float]:
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        assert query
+        assert len(documents) == len(self.scores)
+        return self.scores
 
 
 class _Store(TreeVectorStore):
@@ -164,6 +181,109 @@ async def test_method_mode_expands_a_leaf_to_related_sibling_chunks() -> None:
     assert sibling.expanded_from == "method"
     assert report.expanded_candidate_count == 1
     assert sibling.ranking_score != sibling.vector_score
+    assert report.mmr_candidate_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cross_encoder_controls_final_order() -> None:
+    retriever = TreeRagRetriever(
+        embedder=_Embedder(),
+        vector_store=_Store(),
+        reranker=_Reranker([0.1, 0.9]),
+    )
+
+    report = await retriever.retrieve(
+        "Explain the retrieval method",
+        paper_ids=["paper"],
+        mode=RetrievalMode.METHOD,
+    )
+
+    assert [hit.node_id for hit in report.hits] == ["chunk-b", "chunk-a"]
+    assert [hit.rerank_score for hit in report.hits] == [0.9, 0.1]
+    assert report.reranker_applied is True
+    assert report.reranker_name == "test-cross-encoder"
+
+
+@pytest.mark.asyncio
+async def test_reranker_failure_falls_back_and_is_observable() -> None:
+    retriever = TreeRagRetriever(
+        embedder=_Embedder(),
+        vector_store=_Store(),
+        reranker=_Reranker([], error="model unavailable"),
+    )
+
+    report = await retriever.retrieve(
+        "Explain the retrieval method",
+        paper_ids=["paper"],
+        mode=RetrievalMode.METHOD,
+    )
+
+    assert [hit.node_id for hit in report.hits] == ["chunk-a", "chunk-b"]
+    assert report.reranker_applied is False
+    assert report.reranker_error == "model unavailable"
+
+
+@pytest.mark.asyncio
+async def test_normalized_duplicate_chunks_are_removed_before_mmr() -> None:
+    store = _Store()
+    store.chunk_b = _node(
+        "chunk-b",
+        TreeNodeType.CHUNK,
+        parent_id="method",
+        text="  treerag BUILDS a hierarchical index.  ",
+    )
+    retriever = TreeRagRetriever(embedder=_Embedder(), vector_store=store)
+
+    report = await retriever.retrieve(
+        "Explain the retrieval method",
+        paper_ids=["paper"],
+        mode=RetrievalMode.METHOD,
+    )
+
+    assert [hit.node_id for hit in report.hits] == ["chunk-a"]
+    assert report.deduplicated_candidate_count == 1
+
+
+def test_mmr_prefers_a_diverse_chunk_over_a_near_duplicate() -> None:
+    retriever = TreeRagRetriever(
+        embedder=_Embedder(),
+        vector_store=_Store(),
+        mmr_top_k=2,
+        mmr_lambda=0.5,
+    )
+    candidates = [
+        (
+            _Candidate(
+                node=_node("a", TreeNodeType.CHUNK, text="top result"),
+                vector_score=1.0,
+                source=RetrievalSource.VECTOR,
+                embedding=[1.0, 0.0],
+            ),
+            1.0,
+        ),
+        (
+            _Candidate(
+                node=_node("b", TreeNodeType.CHUNK, text="near duplicate"),
+                vector_score=0.99,
+                source=RetrievalSource.VECTOR,
+                embedding=[0.999, 0.001],
+            ),
+            0.99,
+        ),
+        (
+            _Candidate(
+                node=_node("c", TreeNodeType.CHUNK, text="different evidence"),
+                vector_score=0.8,
+                source=RetrievalSource.VECTOR,
+                embedding=[0.0, 1.0],
+            ),
+            0.8,
+        ),
+    ]
+
+    selected = retriever._mmr_select(candidates)  # noqa: SLF001
+
+    assert [item[0].node.node_id for item in selected] == ["a", "c"]
 
 
 @pytest.mark.asyncio

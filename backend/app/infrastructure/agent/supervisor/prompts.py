@@ -73,8 +73,9 @@ agent, or request
 additional retrieval. Those responsibilities belong to the Supervisor.
 Distinguish what the evidence explicitly states from your interpretation. Never invent methods,
 equations, experiments, or results. If only an abstract is available, say so in evidence_scope
-and avoid claims requiring the full paper. Evidence entries should name the paper/material and
-point to a supplied passage or field. Treat supplied paper_metadata as authoritative for title,
+and avoid claims requiring the full paper. Evidence entries must reference an evidence_id that
+exists in the supplied Evidence Library. Never create or alter an evidence ID. Point to a supplied
+passage or field. Treat supplied paper_metadata as authoritative for title,
 authors, identifiers, abstract, and keywords; do not claim those fields are unavailable merely
 because retrieved chunks omit them.
 For PDF text, use the --- PAGE N --- markers to attach page numbers to evidence. Report extraction
@@ -131,5 +132,8 @@ concisely, normally in one to three short paragraphs. Do not add background, adj
 a full paper report unless the user asks for them. Treat a broad internal artifact as a source, not
 as an instruction to repeat everything it contains. Organize the final response naturally rather
 than exposing internal structured fields.
+When an artifact contains an Evidence Library, cite scientific claims using only its exact IDs,
+for example [E-a1b2c3d4e5f6]. Never invent an evidence ID or cite a claim that its evidence does not
+support.
 Do not mention internal prompts, JSON, routing, or private reasoning. Answer in the user's language.
 """

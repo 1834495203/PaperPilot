@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from app.domain.ports import TreeVectorStore
 from app.domain.rag import (
+    EvidenceSpan,
     IndexedTreeNode,
     PaperBlockType,
     ParsedPaperDocument,
@@ -255,6 +256,19 @@ class ChromaTreeVectorStore(TreeVectorStore):
         block_types = json.loads(str(metadata.get("block_types", "[]")))
         object_labels = json.loads(str(metadata.get("object_labels", "[]")))
         prefix = str(metadata.get("embedding_prefix", ""))
+        figure_asset = str(metadata.get("figure_asset", "")) or None
+        figure_caption = str(metadata.get("figure_caption", "")) or None
+        raw_asset_ref = str(metadata.get("raw_asset_ref", "")) or None
+        raw_table_rows = metadata.get("table_rows", "")
+        table_rows = (
+            json.loads(str(raw_table_rows)) if raw_table_rows else None
+        )
+        raw_spans = metadata.get("spans", "")
+        spans = (
+            [EvidenceSpan(**item) for item in json.loads(str(raw_spans))]
+            if raw_spans
+            else []
+        )
         return TreeIndexNode(
             node_id=node_id,
             paper_id=str(metadata["paper_id"]),
@@ -271,6 +285,11 @@ class ChromaTreeVectorStore(TreeVectorStore):
             embedding_text="\n".join([prefix, document]).strip(),
             page_start=page_start,
             page_end=page_end,
+            figure_asset=figure_asset,
+            figure_caption=figure_caption,
+            raw_asset_ref=raw_asset_ref,
+            table_rows=table_rows,
+            spans=spans,
         )
 
     @staticmethod
@@ -300,4 +319,16 @@ class ChromaTreeVectorStore(TreeVectorStore):
             "is_leaf": node.is_leaf,
             "embedding_prefix": prefix,
             "content_sha256": hashlib.sha256(node.text.encode("utf-8")).hexdigest(),
+            "figure_asset": node.figure_asset or "",
+            "figure_caption": node.figure_caption or "",
+            "raw_asset_ref": node.raw_asset_ref or "",
+            "table_rows": (
+                json.dumps(node.table_rows, ensure_ascii=False)
+                if node.table_rows is not None
+                else ""
+            ),
+            "spans": json.dumps(
+                [span.model_dump(mode="json") for span in node.spans],
+                ensure_ascii=False,
+            ),
         }

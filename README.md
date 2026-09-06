@@ -105,8 +105,10 @@ Reader 的内部计划和证据状态保持结构化，但不再强制生成包�
 语义角色和代表性正文。`TreeRagRetriever` 默认按 Paper Root → Section → Chunk 自动分层
 检索，不要求用户或 Agent 预选论文；同时保留少量全库 Chunk 召回作为兜底，避免摘要或章节
 路由漏掉只在正文出现的细节。候选结果综合 Chunk、所属章节、所属论文和查询词覆盖率进行
-parent-aware rerank，并按绝对阈值和相对分差过滤低质量结果，因此 Top K 是上限而不是必须
-填满。总结、方法、比较和综合任务还会在相关章节内执行 tree expansion，将候选还原为可
+parent-aware 初排，并按绝对阈值和相对分差过滤低质量结果。候选随后执行归一化正文去重、
+单论文数量限制和 MMR 多样性选择；配置可选的本地 Cross-Encoder 后再执行最终精排，模型
+不可用时会在检索报告中记录原因并安全回退，因此 Top K 是上限而不是必须填满。总结、方法、
+比较和综合任务还会在相关章节内执行 tree expansion，将候选还原为可
 引用的内容 Chunk，并限制单篇论文的返回数量。当前不使用 LLM 重建已有论文标题。上传的 PDF
 和 manifest 保存在 `PAPER_LIBRARY_PATH`，索引保存在 Chroma。检索报告会记录自动命中的论文
 范围。Reader 根据结构化任务调用
@@ -184,9 +186,12 @@ Set-Location backend
 ```
 
 `--paper-id` 可以重复传入以检索多篇论文；`--mode` 支持 `fact`、`summary`、`method`、
-`compare` 和 `synthesis`。JSON 结果保留章节路径、页码、原始向量分数、rerank 分数以及
-候选来自直接向量召回还是树扩展。当前 rerank 是零额外模型依赖的轻量实现，不等同于
-cross-encoder；接入专用 reranker 后可以替换排序策略而不改变检索结果类型。
+`compare` 和 `synthesis`。JSON 结果保留章节路径、页码、原始向量分数、Cross-Encoder
+分数、MMR 候选数量、精排状态，以及候选来自直接向量召回还是树扩展。默认仍可使用零额外
+模型依赖的 parent-aware 排序；如需真正的本地 Cross-Encoder，执行
+`pip install -e ".[reranker]"` 并配置 `RERANKER_MODEL`。Reader 会把最终 Chunk 构造成稳定
+编号的 Evidence Library，保留 `evidence_id → chunk_id → paper_id → PDF page` 链路，后续
+Reader 报告和 Writer 只能引用其中已有的 Evidence ID。
 
 ## API
 

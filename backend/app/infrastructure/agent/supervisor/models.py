@@ -152,6 +152,7 @@ class SupervisorDecision(BaseModel):
 class PaperEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    evidence_id: str = Field(pattern=r"^E-[0-9a-f]{12}$")
     claim: str
     page: int | None = Field(default=None, ge=1)
     excerpt: str

@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import re
+import shutil
 from contextlib import suppress
 from pathlib import Path
 from uuid import uuid4
@@ -67,6 +68,7 @@ class PaperLibraryService:
         paper_id = f"{self._slug(Path(filename).stem)}-{digest[:12]}"
         pdf_path = self._library_path / f"{paper_id}.pdf"
         manifest_path = self._manifest_path(paper_id)
+        asset_dir = self._library_path / f"{paper_id}.assets"
         existed = pdf_path.exists()
         async with self._lock:
             await asyncio.to_thread(pdf_path.write_bytes, content)
@@ -75,10 +77,12 @@ class PaperLibraryService:
                     str(pdf_path),
                     paper_id=paper_id,
                     title=title.strip() if title and title.strip() else None,
+                    asset_dir=asset_dir,
                 )
             except Exception:
                 if not existed:
                     await asyncio.to_thread(pdf_path.unlink, missing_ok=True)
+                await asyncio.to_thread(shutil.rmtree, asset_dir, True)
                 raise
             record = IndexedPaper(
                 paper_id=paper_id,
@@ -134,6 +138,11 @@ class PaperLibraryService:
                     page_end=item.node.page_end,
                     text_preview=self._preview(item.node.text),
                     text=item.node.text,
+                    figure_asset=item.node.figure_asset,
+                    figure_caption=item.node.figure_caption,
+                    raw_asset_ref=item.node.raw_asset_ref,
+                    table_rows=item.node.table_rows,
+                    spans=item.node.spans,
                 )
                 for item in indexed_nodes
             ),
@@ -154,6 +163,7 @@ class PaperLibraryService:
             sources = [
                 self._manifest_path(paper.paper_id),
                 self._library_path / f"{paper.paper_id}.pdf",
+                self._library_path / f"{paper.paper_id}.assets",
             ]
             token = uuid4().hex
             staged: list[tuple[Path, Path]] = []
@@ -198,11 +208,41 @@ class PaperLibraryService:
     def _manifest_path(self, paper_id: str) -> Path:
         return self._library_path / f"{paper_id}.json"
 
+    def asset_dir_path(self, paper_id: str) -> Path:
+        return self._library_path / f"{paper_id}.assets"
+
+    def get_pdf_path(self, paper_id: str) -> Path:
+        """Resolve the managed PDF file for a validated paper id."""
+        if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", paper_id) is None:
+            raise PaperNotFoundError(paper_id)
+        path = self._library_path / f"{paper_id}.pdf"
+        if not path.is_file():
+            raise PaperNotFoundError(paper_id)
+        return path
+
+    def get_asset_path(self, paper_id: str, filename: str) -> Path:
+        """Resolve a validated asset path for serving an extracted figure image."""
+        if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", paper_id) is None:
+            raise PaperNotFoundError(paper_id)
+        if (
+            re.fullmatch(r"[A-Za-z0-9._-]{1,255}", filename) is None
+            or Path(filename).name != filename
+        ):
+            raise PaperNotFoundError(filename)
+        root = self.asset_dir_path(paper_id).resolve()
+        candidate = (root / filename).resolve()
+        if not candidate.is_relative_to(root):
+            raise PaperNotFoundError(filename)
+        return candidate
+
     @staticmethod
     def _remove_staged_files(staged: list[tuple[Path, Path]]) -> None:
         for _, temporary in staged:
             with suppress(OSError):
-                temporary.unlink(missing_ok=True)
+                if temporary.is_dir():
+                    shutil.rmtree(temporary, ignore_errors=True)
+                else:
+                    temporary.unlink(missing_ok=True)
 
     async def _backfill_legacy_metadata(self) -> None:
         """Upgrade pre-metadata manifests without rebuilding vector embeddings."""

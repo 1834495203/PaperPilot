@@ -25,21 +25,25 @@ class AgentExecutionRecorder:
         input_tokens: int,
         output_tokens: int,
         total_tokens: int,
+        citations: list[dict[str, JsonValue]] | None = None,
     ) -> UUID:
+        metadata: dict[str, JsonValue] = {
+            "run_id": str(context.run_id),
+            "tool_calls": cast(JsonValue, message.tool_calls),
+            "duration_ms": duration_ms,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+            },
+        }
+        if citations:
+            metadata["citations"] = cast(JsonValue, citations)
         stored = await self._store.append_message(
             context.conversation_id,
             MessageRole.ASSISTANT,
             text_from_message_content(message.content),
-            {
-                "run_id": str(context.run_id),
-                "tool_calls": cast(JsonValue, message.tool_calls),
-                "duration_ms": duration_ms,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "total_tokens": total_tokens,
-                },
-            },
+            metadata,
         )
         return stored.id
 

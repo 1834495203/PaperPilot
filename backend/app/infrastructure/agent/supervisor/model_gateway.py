@@ -8,7 +8,7 @@ from typing import TypeVar, cast
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage
 from langchain_core.messages.ai import UsageMetadata
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ValidationError
 
 from app.infrastructure.agent.message_mapper import text_from_message_content
@@ -77,52 +77,44 @@ class ChatModelGateway(AgentModelGateway):
         messages: Sequence[BaseMessage],
         schema: type[ModelT],
     ) -> StructuredModelResult[ModelT]:
-        schema_instruction = (
-            "Return exactly one JSON object matching this JSON Schema. "
-            "Do not use markdown fences or add commentary.\n"
-            f"{json.dumps(schema.model_json_schema(), ensure_ascii=False)}"
-        )
-        augmented = [*messages]
-        if not augmented:
+        if not messages:
             raise ValueError("Structured generation requires at least one message")
-        last = augmented[-1]
-        augmented[-1] = last.model_copy(
-            update={"content": f"{text_from_message_content(last.content)}\n\n{schema_instruction}"}
+        tool = StructuredTool.from_function(
+            func=lambda **kwargs: kwargs,
+            name="submit_result",
+            description=f"Submit the {schema.__name__} result as structured data.",
+            args_schema=schema,
         )
-        structured_model = self._model.bind(response_format={"type": "json_object"})
+        available_tools: dict[str, BaseTool] = {tool.name: tool}
+        augmented = list(messages)
+        bound_model = self._model.bind_tools([tool])
         total_usage = ModelUsage()
-        last_error: ValueError | ValidationError | None = None
+        last_error: ValueError | ValidationError | TypeError | None = None
         for attempt in range(2):
-            response = await structured_model.ainvoke(augmented)
+            response = await bound_model.ainvoke(augmented)
             if not isinstance(response, AIMessage):
                 raise TypeError("Chat model must return an AIMessage")
-            usage = self._usage_from_message(response)
-            total_usage = ModelUsage(
-                input_tokens=total_usage.input_tokens + usage.input_tokens,
-                output_tokens=total_usage.output_tokens + usage.output_tokens,
-                total_tokens=total_usage.total_tokens + usage.total_tokens,
-            )
-            content = text_from_message_content(response.content)
+            total_usage = self._add_usage(total_usage, self._usage_from_message(response))
             try:
-                value = schema.model_validate_json(self._extract_json_object(content))
+                if response.tool_calls:
+                    _, _, arguments = self._validated_tool_call(response, available_tools)
+                    value = schema.model_validate(arguments)
+                else:
+                    content = text_from_message_content(response.content)
+                    value = schema.model_validate_json(self._extract_json_object(content))
                 return StructuredModelResult(value=value, usage=total_usage)
-            except (ValidationError, ValueError) as error:
+            except (ValidationError, ValueError, TypeError) as error:
                 last_error = error
                 if attempt == 0:
-                    augmented.extend(
-                        [
-                            response,
-                            HumanMessage(
-                                content=(
-                                    f"The previous response is invalid for {schema.__name__}. "
-                                    "Rebuild the entire object from scratch and return JSON only. "
-                                    "Ensure every required field is present and all strings are "
-                                    "escaped, "
-                                    "and every comma, bracket, and brace is valid.\n"
-                                    f"Validation errors:\n{self._validation_feedback(error)}"
-                                )
-                            ),
-                        ]
+                    augmented.append(
+                        HumanMessage(
+                            content=(
+                                f"The previous response is invalid for {schema.__name__}. "
+                                "Return exactly one valid tool call (or JSON object) with "
+                                "all required fields.\n"
+                                f"Validation errors:\n{self._validation_feedback(error)}"
+                            )
+                        )
                     )
         raise ValueError(
             f"Model returned invalid {schema.__name__} after one repair attempt: {last_error}"
@@ -185,17 +177,14 @@ class ChatModelGateway(AgentModelGateway):
             except (ValidationError, ValueError, TypeError) as error:
                 last_error = error
                 if attempt == 0:
-                    augmented.extend(
-                        [
-                            response,
-                            HumanMessage(
-                                content=(
-                                    "The previous tool call is invalid. Generate exactly one new "
-                                    "tool call from scratch and do not answer in plain text.\n"
-                                    f"Validation errors:\n{self._validation_feedback(error)}"
-                                )
-                            ),
-                        ]
+                    augmented.append(
+                        HumanMessage(
+                            content=(
+                                "The previous tool call is invalid. Generate exactly one new "
+                                "tool call from scratch and do not answer in plain text.\n"
+                                f"Validation errors:\n{self._validation_feedback(error)}"
+                            )
+                        )
                     )
         raise ValueError(f"Model returned an invalid tool call after one repair: {last_error}")
 

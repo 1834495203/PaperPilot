@@ -20,6 +20,22 @@ export interface Message {
   metadata: Record<string, JsonValue>;
 }
 
+export interface CitationSpan {
+  text: string;
+  page_number: number;
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+}
+
+export interface Citation {
+  evidence_id: string;
+  paper_id: string;
+  paper_title: string;
+  page_start: number | null;
+  page_end: number | null;
+  excerpt: string;
+  spans: CitationSpan[];
+}
+
 export type AgentEventType =
   | "run.started"
   | "stage.started"
@@ -129,6 +145,27 @@ export interface PaperTreeNode {
   page_end: number | null;
   text_preview: string;
   text: string;
+  figure_asset?: string | null;
+  figure_caption?: string | null;
+  raw_asset_ref?: string | null;
+  table_rows?: string[][] | null;
+}
+
+export interface RetrievalHit {
+  rank: number;
+  paper_id: string;
+  paper_title?: string | null;
+  section_path: string[];
+  semantic_role?: string | null;
+  block_types: string[];
+  object_labels: string[];
+  page_start?: number | null;
+  page_end?: number | null;
+  text: string;
+  figure_asset?: string | null;
+  figure_caption?: string | null;
+  raw_asset_ref?: string | null;
+  table_rows?: string[][] | null;
 }
 
 export interface IndexedPaperDetail {

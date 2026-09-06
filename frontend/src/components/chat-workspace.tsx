@@ -26,12 +26,14 @@ import {
   listConversations,
   listMessages,
   listIndexedPapers,
+  regenerateMessage,
   streamMessage,
   uploadPaper,
 } from "@/lib/api";
 import type {
   AgentEvent,
   AgentRun,
+  Citation,
   Conversation,
   ConversationMetricsResponse,
   IndexedPaperDetail,
@@ -83,6 +85,7 @@ export function ChatWorkspace() {
   const [isUploading, setIsUploading] = useState(false);
   const [deletingPaperId, setDeletingPaperId] = useState<string | null>(null);
   const [paperDetail, setPaperDetail] = useState<IndexedPaperDetail | null>(null);
+  const [paperFocusPage, setPaperFocusPage] = useState<number | null>(null);
   const [loadingPaperId, setLoadingPaperId] = useState<string | null>(null);
   const metricsBaseline = useRef<RunMetrics>(EMPTY_METRICS);
   const activeRunId = useRef<string | null>(null);
@@ -306,12 +309,46 @@ export function ChatWorkspace() {
         handleEvent,
         controller.signal,
       );
-      const [storedMessages, storedRuns] = await Promise.all([
+      const [storedMessages, storedRuns, storedEvents] = await Promise.all([
         listMessages(activeId),
         listConversationRuns(activeId),
+        listConversationEvents(activeId),
       ]);
       setMessages(storedMessages);
       setRuns(storedRuns);
+      setEvents(storedEvents);
+      setStreamedAnswer("");
+      setConversations(await listConversations());
+    } catch (caught) {
+      if (!(caught instanceof DOMException && caught.name === "AbortError")) {
+        setError(caught instanceof Error ? caught.message : "请求失败");
+      }
+    } finally {
+      if (streamController.current === controller) streamController.current = null;
+      activeRunId.current = null;
+      setIsRunning(false);
+    }
+  };
+
+  const handleRegenerate = async (messageId: string) => {
+    if (activeId === null || isRunning) return;
+    setError(null);
+    setStreamedAnswer("");
+    metricsBaseline.current = metrics;
+    setIsRunning(true);
+    activeRunId.current = null;
+    const controller = new AbortController();
+    streamController.current = controller;
+    try {
+      await regenerateMessage(activeId, messageId, handleEvent, controller.signal);
+      const [storedMessages, storedRuns, storedEvents] = await Promise.all([
+        listMessages(activeId),
+        listConversationRuns(activeId),
+        listConversationEvents(activeId),
+      ]);
+      setMessages(storedMessages);
+      setRuns(storedRuns);
+      setEvents(storedEvents);
       setStreamedAnswer("");
       setConversations(await listConversations());
     } catch (caught) {
@@ -383,16 +420,21 @@ export function ChatWorkspace() {
     }
   };
 
-  const viewPaper = async (paperId: string) => {
+  const viewPaper = async (paperId: string, focusPage?: number | null) => {
     setError(null);
     setLoadingPaperId(paperId);
     try {
       setPaperDetail(await getIndexedPaperDetail(paperId));
+      setPaperFocusPage(focusPage ?? null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "读取论文索引失败");
     } finally {
       setLoadingPaperId(null);
     }
+  };
+
+  const handleCitationClick = (citation: Citation) => {
+    void viewPaper(citation.paper_id, citation.page_start);
   };
 
   const handleDeletePaper = async (paper: IndexedPaper) => {
@@ -510,15 +552,26 @@ export function ChatWorkspace() {
               <p>{message.content}</p>
             </article>
           ))}
-          {taskView.tasks.map((task) => (
-            <TurnTask
-              assistantMessage={task.assistantMessage}
-              events={task.events}
-              key={task.run.id}
-              run={task.run}
-              userMessage={task.userMessage}
-            />
-          ))}
+          {taskView.tasks.map((task, index) => {
+            const isLatest = index === taskView.tasks.length - 1;
+            const messageId = task.userMessage?.id;
+            const regenerateProps =
+              isLatest && messageId !== undefined
+                ? { onRegenerate: () => void handleRegenerate(messageId) }
+                : {};
+            return (
+              <TurnTask
+                assistantMessage={task.assistantMessage}
+                events={task.events}
+                key={task.run.id}
+                onCitationClick={handleCitationClick}
+                regenerateDisabled={isRunning}
+                run={task.run}
+                userMessage={task.userMessage}
+                {...regenerateProps}
+              />
+            );
+          })}
           {streamedAnswer ? (
             <article className="bubble assistant streaming">
               <span>PAPERPILOT · STREAMING</span><p>{streamedAnswer}</p>
@@ -553,8 +606,12 @@ export function ChatWorkspace() {
         <PaperDetailPanel
           deleteDisabled={isRunning || deletingPaperId !== null}
           detail={paperDetail}
+          focusPage={paperFocusPage}
           isDeleting={deletingPaperId === paperDetail.paper.paper_id}
-          onClose={() => setPaperDetail(null)}
+          onClose={() => {
+            setPaperDetail(null);
+            setPaperFocusPage(null);
+          }}
           onDelete={() => void handleDeletePaper(paperDetail.paper)}
         />
       ) : null}

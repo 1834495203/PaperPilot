@@ -15,6 +15,7 @@ from app.domain.ports import ScientificPaperParser
 from app.domain.rag import (
     BoundingBox,
     CaptionBlock,
+    CodeBlock,
     DocumentBlock,
     EquationBlock,
     FigureBlock,
@@ -88,6 +89,7 @@ class _LayoutPage:
     lines: tuple[_LayoutLine, ...]
     tables: tuple[TableBlock, ...]
     figures: tuple[FigureBlock, ...]
+    code_blocks: tuple[CodeBlock, ...] = ()
 
 
 class PypdfScientificPaperParser(ScientificPaperParser):
@@ -122,12 +124,14 @@ class PypdfScientificPaperParser(ScientificPaperParser):
         *,
         paper_id: str,
         title: str | None = None,
+        asset_dir: Path | None = None,
     ) -> ParsedPaperDocument:
         return await asyncio.to_thread(
             self._parse_sync,
             Path(path),
             paper_id,
             title,
+            asset_dir,
         )
 
     def _parse_sync(
@@ -135,6 +139,7 @@ class PypdfScientificPaperParser(ScientificPaperParser):
         path: Path,
         paper_id: str,
         title: str | None,
+        asset_dir: Path | None,
     ) -> ParsedPaperDocument:
         if path.suffix.lower() != ".pdf":
             raise ScientificPdfParseError("Only PDF documents can be ingested")
@@ -144,7 +149,7 @@ class PypdfScientificPaperParser(ScientificPaperParser):
             reader = PdfReader(path, strict=False)
             if reader.is_encrypted and reader.decrypt("") == 0:
                 raise ScientificPdfParseError("Encrypted PDF requires a password")
-            layout_pages = self._extract_layout_pages(path)
+            layout_pages = self._extract_layout_pages(path, asset_dir)
             page_texts = ["\n".join(line.text for line in page.lines) for page in layout_pages]
             first_page_plain_text = str(reader.pages[0].extract_text() or "")
             pdf_metadata = dict(reader.metadata or {})
@@ -169,6 +174,9 @@ class PypdfScientificPaperParser(ScientificPaperParser):
             source_path=path.resolve(),
             page_count=len(layout_pages),
             sections=sections,
+            page_dimensions={
+                page.page_number: (page.width, page.height) for page in layout_pages
+            },
         )
 
     @staticmethod
@@ -181,7 +189,11 @@ class PypdfScientificPaperParser(ScientificPaperParser):
         plain_text = str(extract_text() or "")
         return max((layout_text, plain_text), key=len)
 
-    def _extract_layout_pages(self, path: Path) -> list[_LayoutPage]:
+    def _extract_layout_pages(
+        self,
+        path: Path,
+        asset_dir: Path | None,
+    ) -> list[_LayoutPage]:
         try:
             pymupdf = importlib.import_module("pymupdf")
         except ModuleNotFoundError as error:
@@ -189,24 +201,35 @@ class PypdfScientificPaperParser(ScientificPaperParser):
                 "PyMuPDF is required for layout-aware scientific PDF parsing"
             ) from error
         pages: list[_LayoutPage] = []
+        seen_xrefs: set[int] = set()
         with pymupdf.open(str(path)) as document:
             for page_index, page in enumerate(document, start=1):
                 page_rect = page.rect
                 width = float(page_rect.width)
                 height = float(page_rect.height)
                 raw = cast(dict[str, Any], page.get_text("dict"))
+                raw_images = self._extract_raw_images(
+                    document, page, page_index, asset_dir, seen_xrefs
+                )
                 lines: list[_LayoutLine] = []
                 figures: list[FigureBlock] = []
+                figure_index = 0
                 for block_index, block in enumerate(raw.get("blocks", [])):
                     if int(block.get("type", 0)) == 1:
                         bbox = self._bbox(block.get("bbox"))
                         if bbox is not None and self._bbox_area(bbox) >= width * height * 0.01:
+                            asset_ref = self._save_figure_png(
+                                page, pymupdf, bbox, page_index, figure_index, asset_dir
+                            )
+                            figure_index += 1
                             figures.append(
                                 FigureBlock(
                                     page_number=page_index,
                                     bbox=bbox,
                                     parse_confidence=0.7,
                                     text=f"Figure region on page {page_index}",
+                                    asset_ref=asset_ref,
+                                    raw_asset_ref=self._match_raw_image(bbox, raw_images),
                                 )
                             )
                         continue
@@ -256,7 +279,11 @@ class PypdfScientificPaperParser(ScientificPaperParser):
                         )
                 merged_lines = self._merge_adjacent_lines(lines)
                 merged_lines = self._merge_wrapped_heading_lines(merged_lines)
+                merged_lines = self._merge_caption_continuations(merged_lines)
                 ordered_lines = self._reading_order(merged_lines, width)
+                code_blocks, ordered_lines = self._extract_code_blocks(
+                    page, page_index, ordered_lines
+                )
                 tables = self._extract_tables(page, page_index, merged_lines)
                 pages.append(
                     _LayoutPage(
@@ -266,9 +293,220 @@ class PypdfScientificPaperParser(ScientificPaperParser):
                         lines=tuple(self._with_vertical_gaps(ordered_lines)),
                         tables=tuple(tables),
                         figures=tuple(figures),
+                        code_blocks=tuple(code_blocks),
                     )
                 )
         return pages
+
+    @staticmethod
+    def _save_figure_png(
+        page: Any,
+        pymupdf: Any,
+        bbox: BoundingBox,
+        page_number: int,
+        figure_index: int,
+        asset_dir: Path | None,
+    ) -> str | None:
+        """Render a detected figure region to a PNG inside the paper's asset directory."""
+        if asset_dir is None:
+            return None
+        filename = f"fig-{page_number:04d}-{figure_index:02d}.png"
+        try:
+            clip = pymupdf.Rect(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
+            pixmap = page.get_pixmap(clip=clip, dpi=144)
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            pixmap.save(asset_dir / filename)
+        except Exception:
+            return None
+        return filename
+
+    @staticmethod
+    def _extract_raw_images(
+        document: Any,
+        page: Any,
+        page_number: int,
+        asset_dir: Path | None,
+        seen_xrefs: set[int],
+    ) -> list[tuple[BoundingBox, str]]:
+        """Save embedded raster images and return their placement rects + filenames."""
+        if asset_dir is None:
+            return []
+        page_area = float(page.rect.width * page.rect.height)
+        results: list[tuple[BoundingBox, str]] = []
+        for info in page.get_images(full=True):
+            xref = int(info[0])
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            try:
+                rects = page.get_image_rects(xref)
+            except Exception:
+                continue
+            significant: list[BoundingBox] = []
+            for rect in rects:
+                bbox = PypdfScientificPaperParser._bbox(rect)
+                if (
+                    bbox is not None
+                    and PypdfScientificPaperParser._bbox_area(bbox) >= page_area * 0.01
+                ):
+                    significant.append(bbox)
+            if not significant:
+                continue
+            try:
+                meta = document.extract_image(xref)
+                extension = str(meta.get("ext") or "png")
+                data = meta.get("image")
+            except Exception:
+                continue
+            if not data:
+                continue
+            filename = f"raw-{page_number:04d}-{xref}.{extension}"
+            try:
+                asset_dir.mkdir(parents=True, exist_ok=True)
+                (asset_dir / filename).write_bytes(data)
+            except OSError:
+                continue
+            for bbox in significant:
+                results.append((bbox, filename))
+        return results
+
+    @staticmethod
+    def _match_raw_image(
+        bbox: BoundingBox,
+        raw_images: list[tuple[BoundingBox, str]],
+    ) -> str | None:
+        best: str | None = None
+        best_area = 0.0
+        for image_bbox, filename in raw_images:
+            intersection = PypdfScientificPaperParser._intersection_area(bbox, image_bbox)
+            if intersection > best_area:
+                best_area = intersection
+                best = filename
+        return best if best_area > 0 else None
+
+    @staticmethod
+    def _intersection_area(left: BoundingBox, right: BoundingBox) -> float:
+        x_overlap = max(0.0, min(left.x1, right.x1) - max(left.x0, right.x0))
+        y_overlap = max(0.0, min(left.y1, right.y1) - max(left.y0, right.y0))
+        return x_overlap * y_overlap
+
+    def _extract_code_blocks(
+        self,
+        page: Any,
+        page_number: int,
+        lines: list[_LayoutLine],
+    ) -> tuple[list[CodeBlock], list[_LayoutLine]]:
+        """Detect boxed algorithm/pseudocode regions and merge them into atomic blocks."""
+        boxes = self._merge_adjacent_boxes(self._rule_boxes(page))
+        if not boxes or not lines:
+            return [], lines
+
+        code_boxes: list[tuple[float, float, float, float]] = []
+        for box in boxes:
+            inside = [line for line in lines if self._line_in_box(line, box)]
+            if not inside:
+                continue
+            titled = any(
+                re.match(
+                    r"^(algorithm|procedure|function)\b",
+                    line.text.strip(),
+                    re.IGNORECASE,
+                )
+                for line in inside
+            )
+            if titled:
+                code_boxes.append(box)
+
+        if not code_boxes:
+            return [], lines
+
+        code_blocks: list[CodeBlock] = []
+        removed: set[int] = set()
+        for box in code_boxes:
+            inside = [
+                (index, line)
+                for index, line in enumerate(lines)
+                if self._line_in_box(line, box)
+            ]
+            if not inside:
+                continue
+            text = "\n".join(line.text for _, line in inside).strip()
+            code_blocks.append(
+                CodeBlock(
+                    page_number=page_number,
+                    bbox=BoundingBox(x0=box[0], y0=box[1], x1=box[2], y1=box[3]),
+                    parse_confidence=0.85,
+                    text=text,
+                )
+            )
+            removed.update(index for index, _ in inside)
+        remaining = [line for index, line in enumerate(lines) if index not in removed]
+        return code_blocks, remaining
+
+    @staticmethod
+    def _merge_adjacent_boxes(
+        boxes: list[tuple[float, float, float, float]],
+    ) -> list[tuple[float, float, float, float]]:
+        """Merge vertically-adjacent boxes that share the same horizontal extent."""
+        if not boxes:
+            return []
+        merged: list[tuple[float, float, float, float]] = []
+        for box in sorted(boxes, key=lambda item: (item[1], item[0])):
+            if merged:
+                previous = merged[-1]
+                same_extent = (
+                    abs(previous[0] - box[0]) <= 8 and abs(previous[2] - box[2]) <= 8
+                )
+                contiguous = -5 <= box[1] - previous[3] <= 5
+                if same_extent and contiguous:
+                    merged[-1] = (previous[0], previous[1], previous[2], box[3])
+                    continue
+            merged.append(box)
+        return merged
+
+
+    @staticmethod
+    def _rule_boxes(page: Any) -> list[tuple[float, float, float, float]]:
+        """Pair horizontal vector rules into (x0, y0, x1, y1) rectangles."""
+        get_drawings = getattr(page, "get_drawings", None)
+        if get_drawings is None:
+            return []
+        page_width = float(page.rect.width)
+        rules: list[tuple[float, float, float]] = []
+        try:
+            drawings = get_drawings()
+        except Exception:
+            return []
+        for drawing in drawings:
+            rect = drawing.get("rect")
+            if rect is None:
+                continue
+            if float(rect.height) <= 1.5 and float(rect.width) >= page_width * 0.3:
+                rules.append((float(rect.y0), float(rect.x0), float(rect.x1)))
+        rules.sort()
+        boxes: list[tuple[float, float, float, float]] = []
+        for index, (y0, x0, x1) in enumerate(rules):
+            for y1, bottom_x0, bottom_x1 in rules[index + 1 :]:
+                if y1 - y0 < 20:
+                    continue
+                if abs(x0 - bottom_x0) <= 8 and abs(x1 - bottom_x1) <= 8:
+                    boxes.append((min(x0, bottom_x0), y0, max(x1, bottom_x1), y1))
+                    break
+        return boxes
+
+    @staticmethod
+    def _line_in_box(
+        line: _LayoutLine,
+        box: tuple[float, float, float, float],
+    ) -> bool:
+        x0, y0, x1, y1 = box
+        pad = 2.0
+        return (
+            line.bbox.x0 >= x0 - pad
+            and line.bbox.x1 <= x1 + pad
+            and line.bbox.y0 >= y0 - pad
+            and line.bbox.y1 <= y1 + pad
+        )
 
     @classmethod
     def _extract_tables(
@@ -357,6 +595,16 @@ class PypdfScientificPaperParser(ScientificPaperParser):
 
     @staticmethod
     def _bbox(value: object) -> BoundingBox | None:
+        if value is None:
+            return None
+        if all(hasattr(value, attribute) for attribute in ("x0", "y0", "x1", "y1")):
+            rect = cast(Any, value)
+            return BoundingBox(
+                x0=float(rect.x0),
+                y0=float(rect.y0),
+                x1=float(rect.x1),
+                y1=float(rect.y1),
+            )
         if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
             return None
         coordinates = list(value)
@@ -478,6 +726,56 @@ class PypdfScientificPaperParser(ScientificPaperParser):
                 source_block=previous.source_block,
             )
         return merged
+
+    def _merge_caption_continuations(
+        self,
+        lines: list[_LayoutLine],
+    ) -> list[_LayoutLine]:
+        """Fold wrapped caption lines into their caption's first line so captions stay intact."""
+        merged: list[_LayoutLine] = []
+        index = 0
+        while index < len(lines):
+            caption = lines[index]
+            merged.append(caption)
+            index += 1
+            if self._caption_parts(caption.text) is None:
+                continue
+            while index < len(lines) and self._is_caption_continuation(caption, lines[index]):
+                next_line = lines[index]
+                caption = _LayoutLine(
+                    page_number=caption.page_number,
+                    page_width=caption.page_width,
+                    page_height=caption.page_height,
+                    text=f"{caption.text} {next_line.text}",
+                    bbox=BoundingBox(
+                        x0=min(caption.bbox.x0, next_line.bbox.x0),
+                        y0=caption.bbox.y0,
+                        x1=max(caption.bbox.x1, next_line.bbox.x1),
+                        y1=next_line.bbox.y1,
+                    ),
+                    spans=(*caption.spans, *next_line.spans),
+                    font_size=max(caption.font_size, next_line.font_size),
+                    bold=caption.bold or next_line.bold,
+                    italic=caption.italic or next_line.italic,
+                    source_block=next_line.source_block,
+                )
+                merged[-1] = caption
+                index += 1
+        return merged
+
+    def _is_caption_continuation(self, caption: _LayoutLine, line: _LayoutLine) -> bool:
+        if self._caption_parts(line.text) is not None:
+            return False
+        if self._looks_like_equation(line.text):
+            return False
+        if self._valid_numbered_heading(line.text) is not None:
+            return False
+        if abs(line.bbox.x0 - caption.bbox.x0) > 12:
+            return False
+        if abs(line.font_size - caption.font_size) > 1.5:
+            return False
+        gap = line.bbox.y0 - caption.bbox.y1
+        return -line.font_size <= gap <= line.font_size * 1.5
 
     @classmethod
     def _reading_order(cls, lines: list[_LayoutLine], page_width: float) -> list[_LayoutLine]:
@@ -626,7 +924,11 @@ class PypdfScientificPaperParser(ScientificPaperParser):
                         page_objects[object_index]
                     )
                     object_index += 1
-                if line.text.strip() in repeated_lines or self._inside_objects(line, page_objects):
+                if (
+                    line.text.strip() in repeated_lines
+                    or self._is_page_number_line(line)
+                    or self._inside_objects(line, page_objects)
+                ):
                     continue
                 key = self._line_key(line)
                 if key in heading_keys:
@@ -686,6 +988,8 @@ class PypdfScientificPaperParser(ScientificPaperParser):
         style_counts: Counter[tuple[float, bool, bool, int]],
     ) -> bool:
         text = re.sub(r"\s+", " ", line.text).strip()
+        if line.font_size < body_font_size * 0.8:
+            return False
         if (
             len(text) < 3
             or len(text) > 180
@@ -693,7 +997,7 @@ class PypdfScientificPaperParser(ScientificPaperParser):
             or not any(character.isalpha() for character in text)
             or self._caption_parts(text) is not None
             or self._looks_like_equation(text)
-            or text.endswith((".", "?", "!", ";"))
+            or text.endswith((".", "!", ";"))
             or (". " in text and len(text.split()) > 8)
             or text.endswith("-")
         ):
@@ -755,6 +1059,22 @@ class PypdfScientificPaperParser(ScientificPaperParser):
             line.page_number > 1 and near_edge and page_number
         )
 
+    @staticmethod
+    def _is_page_number_line(line: _LayoutLine) -> bool:
+        """Detect a standalone page number (or page/total) printed in the header/footer band."""
+        normalized = re.sub(r"\s+", " ", line.text).strip().casefold()
+        if not re.fullmatch(
+            r"\d{1,4}"
+            r"|page\s*\d{1,4}(?:\s*(?:of|/)\s*\d{1,4})?"
+            r"|\d{1,4}\s*/\s*\d{1,4}",
+            normalized,
+        ):
+            return False
+        return (
+            line.bbox.y0 < line.page_height * 0.07
+            or line.bbox.y1 > line.page_height * 0.93
+        )
+
     def _infer_heading_levels(
         self,
         headings: list[_LayoutLine],
@@ -788,43 +1108,49 @@ class PypdfScientificPaperParser(ScientificPaperParser):
             return None, text.strip().rstrip(":")
         return numbered[0], numbered[1]
 
-    @staticmethod
-    def _merge_text_blocks(blocks: list[DocumentBlock]) -> list[DocumentBlock]:
+    @classmethod
+    def _merge_text_blocks(cls, blocks: list[DocumentBlock]) -> list[DocumentBlock]:
         merged: list[DocumentBlock] = []
         for block in blocks:
             previous = merged[-1] if merged else None
             if not isinstance(block, PageTextBlock) or not isinstance(previous, PageTextBlock):
                 merged.append(block)
                 continue
-            if (
-                block.bbox is None
-                or previous.bbox is None
-                or block.page_number != previous.page_number
-            ):
+            if block.bbox is None or previous.bbox is None:
                 merged.append(block)
                 continue
-            font_size = next(
-                (span.font_size for span in block.spans if span.font_size is not None),
-                10.0,
-            )
+            same_page = block.page_number == previous.page_number
             same_column = abs(block.bbox.x0 - previous.bbox.x0) <= 35
-            vertical_gap = block.bbox.y0 - previous.bbox.y1
-            if not same_column or not -1 <= vertical_gap <= font_size * 0.7:
+            if same_page and same_column:
+                font_size = next(
+                    (span.font_size for span in block.spans if span.font_size is not None),
+                    10.0,
+                )
+                vertical_gap = block.bbox.y0 - previous.bbox.y1
+                if not -1 <= vertical_gap <= font_size * 0.7:
+                    merged.append(block)
+                    continue
+            elif not cls._sentence_continues(previous.text, block.text):
                 merged.append(block)
                 continue
             if previous.text.endswith("-") and block.text[:1].islower():
                 joined = f"{previous.text[:-1]}{block.text}"
             else:
                 joined = f"{previous.text} {block.text}"
+            merged_bbox = (
+                BoundingBox(
+                    x0=min(previous.bbox.x0, block.bbox.x0),
+                    y0=previous.bbox.y0,
+                    x1=max(previous.bbox.x1, block.bbox.x1),
+                    y1=block.bbox.y1,
+                )
+                if same_page and same_column
+                else previous.bbox
+            )
             merged[-1] = previous.model_copy(
                 update={
                     "text": joined,
-                    "bbox": BoundingBox(
-                        x0=min(previous.bbox.x0, block.bbox.x0),
-                        y0=previous.bbox.y0,
-                        x1=max(previous.bbox.x1, block.bbox.x1),
-                        y1=block.bbox.y1,
-                    ),
+                    "bbox": merged_bbox,
                     "spans": [*previous.spans, *block.spans],
                     "parse_confidence": min(
                         previous.parse_confidence,
@@ -833,6 +1159,13 @@ class PypdfScientificPaperParser(ScientificPaperParser):
                 }
             )
         return merged
+
+    @staticmethod
+    def _sentence_continues(previous_text: str, next_text: str) -> bool:
+        previous = previous_text.rstrip()
+        if not previous or not next_text or not next_text[:1].islower():
+            return False
+        return re.search(r'[.!?。！？]["\')\]]*\s*$', previous) is None
 
     @staticmethod
     def _numbering_level(index: str) -> int:
@@ -847,24 +1180,30 @@ class PypdfScientificPaperParser(ScientificPaperParser):
     def _linked_page_objects(self, page: _LayoutPage) -> list[DocumentBlock]:
         captions = [line for line in page.lines if self._caption_parts(line.text) is not None]
         objects: list[DocumentBlock] = []
-        for raw in [*page.tables, *page.figures]:
+        for raw in [*page.tables, *page.figures, *page.code_blocks]:
+            if isinstance(raw, CodeBlock):
+                objects.append(raw)
+                continue
             target = PaperBlockType.TABLE if isinstance(raw, TableBlock) else PaperBlockType.FIGURE
             caption_line = self._nearest_caption(raw.bbox, captions, target)
             caption = caption_line.text if caption_line is not None else None
             caption_parts = self._caption_parts(caption)
             label = caption_parts[1] if caption_parts is not None else None
-            prefix = f"{caption}\n" if caption else ""
+            update: dict[str, Any] = {
+                "block_id": f"page:{page.page_number}:{target.value}:{len(objects) + 1}",
+                "caption": caption,
+                "object_label": label,
+            }
+            if isinstance(raw, FigureBlock):
+                update["text"] = caption or f"Figure (page {raw.page_number})"
+            else:
+                already_prefixed = caption is not None and raw.text.strip() == caption
+                prefix = "" if already_prefixed else (f"{caption}\n" if caption else "")
+                update["text"] = f"{prefix}{raw.text}".strip()
             objects.append(
                 cast(
                     DocumentBlock,
-                    raw.model_copy(
-                    update={
-                        "block_id": f"page:{page.page_number}:{target.value}:{len(objects) + 1}",
-                        "caption": caption,
-                        "object_label": label,
-                        "text": f"{prefix}{raw.text}".strip(),
-                    },
-                    ),
+                    raw.model_copy(update=update),
                 )
             )
         return sorted(objects, key=self._block_y)
@@ -1101,7 +1440,7 @@ class PypdfScientificPaperParser(ScientificPaperParser):
         forbidden = {"←", "→", "∅", "∪", "=", "≤", "≥"}
         if (
             len(title.split()) > 16
-            or title.endswith((".", "?", "!"))
+            or title.endswith((".", "!"))
             or any(symbol in title for symbol in forbidden)
             or not title[:1].isupper()
         ):

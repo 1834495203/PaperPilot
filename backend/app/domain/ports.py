@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from pathlib import Path
 from uuid import UUID
 
 from app.domain.entities import (
@@ -98,6 +99,12 @@ class ConversationStore(ABC):
     @abstractmethod
     async def append_event(self, event: AgentEvent) -> None: ...
 
+    @abstractmethod
+    async def delete_messages_from(self, conversation_id: UUID, sequence: int) -> None: ...
+
+    @abstractmethod
+    async def delete_run(self, run_id: UUID) -> None: ...
+
 
 class PaperSearchGateway(ABC):
     @abstractmethod
@@ -117,6 +124,7 @@ class ScientificPaperParser(ABC):
         *,
         paper_id: str,
         title: str | None = None,
+        asset_dir: Path | None = None,
     ) -> ParsedPaperDocument: ...
 
 
@@ -126,6 +134,19 @@ class TextEmbeddingGateway(ABC):
 
     @abstractmethod
     async def embed_query(self, text: str) -> list[float]: ...
+
+
+class TextRerankerGateway(ABC):
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @abstractmethod
+    async def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+    ) -> list[float]: ...
 
 
 class TreeVectorStore(ABC):

@@ -82,6 +82,11 @@ class PaperTreeNodeResponse(BaseModel):
     page_end: int | None
     text_preview: str
     text: str
+    figure_asset: str | None = None
+    figure_caption: str | None = None
+    raw_asset_ref: str | None = None
+    table_rows: list[list[str]] | None = None
+    spans: list[dict[str, JsonValue]] = Field(default_factory=list)
 
 
 class IndexedPaperDetailResponse(BaseModel):
@@ -111,6 +116,7 @@ class RetrievalHitResponse(BaseModel):
     rank: int
     node_id: str
     paper_id: str
+    paper_title: str | None
     section_path: list[str]
     semantic_role: str | None
     block_types: list[str]
@@ -120,8 +126,14 @@ class RetrievalHitResponse(BaseModel):
     text: str
     vector_score: float
     ranking_score: float
+    rerank_score: float | None
     source: str
     expanded_from: str | None
+    figure_asset: str | None = None
+    figure_caption: str | None = None
+    raw_asset_ref: str | None = None
+    table_rows: list[list[str]] | None = None
+    spans: list[dict[str, JsonValue]] = Field(default_factory=list)
 
     @classmethod
     def from_domain(cls, hit: RetrievalHit) -> "RetrievalHitResponse":
@@ -136,6 +148,11 @@ class TreeRetrievalResponse(BaseModel):
     candidate_paper_ids: list[str]
     initial_hit_count: int
     expanded_candidate_count: int
+    deduplicated_candidate_count: int
+    mmr_candidate_count: int
+    reranker_name: str | None
+    reranker_applied: bool
+    reranker_error: str | None
     hits: list[RetrievalHitResponse]
 
     @classmethod
@@ -148,6 +165,11 @@ class TreeRetrievalResponse(BaseModel):
             candidate_paper_ids=report.candidate_paper_ids,
             initial_hit_count=report.initial_hit_count,
             expanded_candidate_count=report.expanded_candidate_count,
+            deduplicated_candidate_count=report.deduplicated_candidate_count,
+            mmr_candidate_count=report.mmr_candidate_count,
+            reranker_name=report.reranker_name,
+            reranker_applied=report.reranker_applied,
+            reranker_error=report.reranker_error,
             hits=[RetrievalHitResponse.from_domain(hit) for hit in report.hits],
         )
 

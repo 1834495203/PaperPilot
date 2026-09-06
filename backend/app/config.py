@@ -83,16 +83,22 @@ class Settings(BaseSettings):
     paper_library_path: Path = Path("./data/papers")
     upload_max_bytes: int = Field(default=30_000_000, ge=1_000_000, le=100_000_000)
     tree_chunk_max_chars: int = Field(default=1_800, ge=200, le=20_000)
+    tree_chunk_overlap_sentences: int = Field(default=1, ge=0, le=10)
     retrieval_initial_top_k: int = Field(default=12, ge=1, le=100)
     retrieval_final_top_k: int = Field(default=8, ge=1, le=50)
     retrieval_max_expanded_per_hit: int = Field(default=8, ge=1, le=100)
     retrieval_max_candidates: int = Field(default=40, ge=1, le=500)
-    retrieval_max_chunks_per_paper: int = Field(default=8, ge=1, le=100)
+    retrieval_max_chunks_per_paper: int = Field(default=3, ge=1, le=100)
     retrieval_paper_top_k: int = Field(default=5, ge=1, le=50)
     retrieval_sections_per_paper: int = Field(default=3, ge=1, le=20)
     retrieval_global_fallback_top_k: int = Field(default=6, ge=1, le=100)
     retrieval_min_ranking_score: float = Field(default=0.20, ge=-1.0, le=1.0)
     retrieval_score_window: float = Field(default=0.18, ge=0.0, le=2.0)
+    retrieval_mmr_top_k: int = Field(default=30, ge=1, le=200)
+    retrieval_mmr_lambda: float = Field(default=0.70, ge=0.0, le=1.0)
+    reranker_model: str | None = None
+    reranker_device: str | None = None
+    reranker_max_length: int = Field(default=512, ge=32, le=8_192)
 
 
 @lru_cache(maxsize=1)

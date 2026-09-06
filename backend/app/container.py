@@ -13,6 +13,7 @@ from app.infrastructure.db.store import SqlAlchemyConversationStore
 from app.infrastructure.rag.chroma_store import ChromaTreeVectorStore
 from app.infrastructure.rag.embeddings import OpenAITextEmbeddingGateway
 from app.infrastructure.rag.pdf_parser import PypdfScientificPaperParser
+from app.infrastructure.rag.reranker import SentenceTransformerCrossEncoderReranker
 from app.infrastructure.rag.tree_chunker import TreeRagChunker
 from app.infrastructure.tools.arxiv import ArxivPaperSearchGateway
 from app.infrastructure.tools.openalex import OpenAlexPaperSearchGateway
@@ -84,9 +85,19 @@ class ApplicationContainer:
             persist_directory=settings.vector_db_path,
             collection_name=settings.vector_collection,
         )
+        reranker = (
+            SentenceTransformerCrossEncoderReranker(
+                model_name=settings.reranker_model,
+                max_length=settings.reranker_max_length,
+                device=settings.reranker_device,
+            )
+            if settings.reranker_model
+            else None
+        )
         retriever = TreeRagRetriever(
             embedder=embedder,
             vector_store=vector_store,
+            reranker=reranker,
             initial_top_k=settings.retrieval_initial_top_k,
             final_top_k=settings.retrieval_final_top_k,
             max_expanded_per_hit=settings.retrieval_max_expanded_per_hit,
@@ -97,11 +108,16 @@ class ApplicationContainer:
             global_fallback_top_k=settings.retrieval_global_fallback_top_k,
             min_ranking_score=settings.retrieval_min_ranking_score,
             score_window=settings.retrieval_score_window,
+            mmr_top_k=settings.retrieval_mmr_top_k,
+            mmr_lambda=settings.retrieval_mmr_lambda,
         )
         paper_parser = PypdfScientificPaperParser()
         ingestion = PaperIngestionService(
             parser=paper_parser,
-            chunker=TreeRagChunker(max_chunk_chars=settings.tree_chunk_max_chars),
+            chunker=TreeRagChunker(
+                max_chunk_chars=settings.tree_chunk_max_chars,
+                overlap_sentences=settings.tree_chunk_overlap_sentences,
+            ),
             embedder=embedder,
             vector_store=vector_store,
         )

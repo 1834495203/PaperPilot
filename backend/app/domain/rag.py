@@ -35,6 +35,7 @@ class PaperBlockType(StrEnum):
     FIGURE = "figure"
     EQUATION = "equation"
     CAPTION = "caption"
+    CODE = "code"
 
 
 class BoundingBox(BaseModel):
@@ -61,6 +62,16 @@ class TextSpan(BaseModel):
     font_size: float | None = Field(default=None, gt=0)
     bold: bool = False
     italic: bool = False
+
+
+class EvidenceSpan(BaseModel):
+    """A page-anchored text span used to link evidence back to its source region."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    text: str = Field(min_length=1)
+    page_number: int = Field(ge=1)
+    bbox: BoundingBox
 
 
 class DocumentBlockBase(BaseModel):
@@ -91,6 +102,8 @@ class FigureBlock(DocumentBlockBase):
     block_type: Literal[PaperBlockType.FIGURE] = PaperBlockType.FIGURE
     object_label: str | None = None
     caption: str | None = None
+    asset_ref: str | None = None
+    raw_asset_ref: str | None = None
 
 
 class EquationBlock(DocumentBlockBase):
@@ -106,8 +119,13 @@ class CaptionBlock(DocumentBlockBase):
     target_type: PaperBlockType | None = None
 
 
+class CodeBlock(DocumentBlockBase):
+    block_type: Literal[PaperBlockType.CODE] = PaperBlockType.CODE
+    language: str | None = None
+
+
 DocumentBlock = Annotated[
-    PageTextBlock | TableBlock | FigureBlock | EquationBlock | CaptionBlock,
+    PageTextBlock | TableBlock | FigureBlock | EquationBlock | CaptionBlock | CodeBlock,
     Field(discriminator="block_type"),
 ]
 
@@ -147,6 +165,7 @@ class ParsedPaperDocument(BaseModel):
     source_path: Path
     page_count: int = Field(ge=1)
     sections: list[PaperSection]
+    page_dimensions: dict[int, tuple[float, float]] = Field(default_factory=dict)
 
     @property
     def title(self) -> str:
@@ -171,6 +190,11 @@ class TreeIndexNode(BaseModel):
     embedding_text: str = Field(min_length=1)
     page_start: int | None = Field(default=None, ge=1)
     page_end: int | None = Field(default=None, ge=1)
+    figure_asset: str | None = None
+    figure_caption: str | None = None
+    raw_asset_ref: str | None = None
+    table_rows: list[list[str]] | None = None
+    spans: list[EvidenceSpan] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -240,6 +264,11 @@ class PaperTreeNodeView(BaseModel):
     page_end: int | None
     text_preview: str
     text: str
+    figure_asset: str | None = None
+    figure_caption: str | None = None
+    raw_asset_ref: str | None = None
+    table_rows: list[list[str]] | None = None
+    spans: list[EvidenceSpan] = Field(default_factory=list)
 
 
 class IndexedPaperDetail(BaseModel):
@@ -269,6 +298,7 @@ class RetrievalHit(BaseModel):
     rank: int = Field(ge=1)
     node_id: str
     paper_id: str
+    paper_title: str | None = None
     section_path: list[str]
     semantic_role: str | None = None
     block_types: list[PaperBlockType] = Field(default_factory=list)
@@ -278,8 +308,14 @@ class RetrievalHit(BaseModel):
     text: str
     vector_score: float
     ranking_score: float
+    rerank_score: float | None = None
     source: RetrievalSource
     expanded_from: str | None = None
+    figure_asset: str | None = None
+    figure_caption: str | None = None
+    raw_asset_ref: str | None = None
+    table_rows: list[list[str]] | None = None
+    spans: list[EvidenceSpan] = Field(default_factory=list)
 
 
 class TreeRetrievalReport(BaseModel):
@@ -292,4 +328,37 @@ class TreeRetrievalReport(BaseModel):
     candidate_paper_ids: list[str] = Field(default_factory=list)
     initial_hit_count: int = Field(ge=0)
     expanded_candidate_count: int = Field(ge=0)
+    deduplicated_candidate_count: int = Field(default=0, ge=0)
+    mmr_candidate_count: int = Field(default=0, ge=0)
+    reranker_name: str | None = None
+    reranker_applied: bool = False
+    reranker_error: str | None = None
     hits: list[RetrievalHit]
+
+
+class Evidence(BaseModel):
+    """One immutable, fully traceable piece of retrieved source evidence."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    evidence_id: str = Field(pattern=r"^E-[0-9a-f]{12}$")
+    paper_id: str
+    paper_title: str
+    chunk_id: str
+    section_path: list[str]
+    page_start: int | None = Field(default=None, ge=1)
+    page_end: int | None = Field(default=None, ge=1)
+    raw_text: str = Field(min_length=1)
+    evidence_text: str = Field(min_length=1)
+    retrieval_score: float
+    rerank_score: float | None = None
+    evidence_score: float | None = Field(default=None, ge=0, le=10)
+    supported_claims: list[str] = Field(default_factory=list)
+    spans: list[EvidenceSpan] = Field(default_factory=list)
+
+
+class EvidenceLibrary(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    objective: str = Field(min_length=1)
+    evidence: list[Evidence]

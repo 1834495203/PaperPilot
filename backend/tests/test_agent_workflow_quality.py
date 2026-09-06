@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import UTC, datetime
 from typing import cast
@@ -38,6 +39,7 @@ from app.infrastructure.agent.supervisor.models import (
     AnalystTask,
     DecisionAssessment,
     PaperAssessment,
+    PaperEvidence,
     PaperRelevance,
     ReaderAgentSummary,
     ReaderDepth,
@@ -71,6 +73,10 @@ class CapturingPublisher(EventPublisher):
 
     async def publish(self, event_type: str, payload: dict[str, JsonValue]) -> None:
         self.events.append((event_type, payload))
+
+
+def evidence_id(chunk_id: str) -> str:
+    return f"E-{hashlib.sha256(chunk_id.encode('utf-8')).hexdigest()[:12]}"
 
 
 def make_paper(arxiv_id: str = "2401.00001") -> Paper:
@@ -664,7 +670,14 @@ async def test_reader_retrieves_selected_local_paper_as_structured_evidence() ->
                 objective_satisfied=True,
                 answered_points=["Tree construction method"],
                 blocking_gaps=[],
-                evidence=[],
+                evidence=[
+                    PaperEvidence(
+                        evidence_id=evidence_id("local-paper:chunk:1"),
+                        claim="Ancestor titles are embedded with the chunk.",
+                        page=4,
+                        excerpt="preserves ancestor titles as embedding prefixes",
+                    )
+                ],
                 evidence_scope="Retrieved chunks from page 4",
                 limitations=[],
             ),
@@ -730,6 +743,15 @@ async def test_reader_retrieves_selected_local_paper_as_structured_evidence() ->
     assert summary.retrieval_hit_count == 1
     assert summary.retrieval_rounds == 1
     assert summary.attempted_queries == ["How is the tree index built?"]
+    artifact_content = json.loads(update["artifacts"][-1].content)
+    evidence = artifact_content["evidence_library"]["evidence"][0]
+    assert evidence["evidence_id"] == evidence_id("local-paper:chunk:1")
+    assert evidence["chunk_id"] == "local-paper:chunk:1"
+    assert evidence["paper_id"] == "local-paper"
+    assert evidence["page_start"] == 4
+    assert artifact_content["reading_report"]["evidence"][0]["evidence_id"] == evidence_id(
+        "local-paper:chunk:1"
+    )
     assert update["tool_calls"] == 1
     assert update["llm_calls"] == 3
 
@@ -955,6 +977,16 @@ async def test_reader_subgraph_rewrites_query_when_evidence_is_incomplete() -> N
     assert isinstance(summary, ReaderAgentSummary)
     assert summary.retrieval_rounds == 2
     assert summary.retrieval_hit_count == 2
+    artifact_content = json.loads(update["artifacts"][-1].content)
+    evidence = artifact_content["evidence_library"]["evidence"]
+    assert [item["evidence_id"] for item in evidence] == [
+        evidence_id("method-chunk"),
+        evidence_id("experiment-chunk"),
+    ]
+    assert [item["chunk_id"] for item in evidence] == [
+        "method-chunk",
+        "experiment-chunk",
+    ]
     assert update["tool_calls"] == 2
     assert update["llm_calls"] == 4
 

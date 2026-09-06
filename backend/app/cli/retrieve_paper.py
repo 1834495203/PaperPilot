@@ -7,6 +7,7 @@ from app.config import get_settings
 from app.domain.rag import RetrievalMode
 from app.infrastructure.rag.chroma_store import ChromaTreeVectorStore
 from app.infrastructure.rag.embeddings import OpenAITextEmbeddingGateway
+from app.infrastructure.rag.reranker import SentenceTransformerCrossEncoderReranker
 
 
 def _arguments() -> argparse.Namespace:
@@ -32,6 +33,15 @@ def _arguments() -> argparse.Namespace:
 async def _run() -> None:
     args = _arguments()
     settings = get_settings()
+    reranker = (
+        SentenceTransformerCrossEncoderReranker(
+            model_name=settings.reranker_model,
+            max_length=settings.reranker_max_length,
+            device=settings.reranker_device,
+        )
+        if settings.reranker_model
+        else None
+    )
     retriever = TreeRagRetriever(
         embedder=OpenAITextEmbeddingGateway(
             model=settings.embedding_model,
@@ -43,6 +53,7 @@ async def _run() -> None:
             persist_directory=settings.vector_db_path,
             collection_name=settings.vector_collection,
         ),
+        reranker=reranker,
         initial_top_k=settings.retrieval_initial_top_k,
         final_top_k=settings.retrieval_final_top_k,
         max_expanded_per_hit=settings.retrieval_max_expanded_per_hit,
@@ -53,6 +64,8 @@ async def _run() -> None:
         global_fallback_top_k=settings.retrieval_global_fallback_top_k,
         min_ranking_score=settings.retrieval_min_ranking_score,
         score_window=settings.retrieval_score_window,
+        mmr_top_k=settings.retrieval_mmr_top_k,
+        mmr_lambda=settings.retrieval_mmr_lambda,
     )
     report = await retriever.retrieve(
         args.query,

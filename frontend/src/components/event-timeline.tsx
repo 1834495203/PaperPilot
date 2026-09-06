@@ -1,4 +1,5 @@
-import type { AgentEvent, JsonValue, PaperResult } from "@/lib/types";
+import { assetUrl } from "@/lib/api";
+import type { AgentEvent, JsonValue, PaperResult, RetrievalHit } from "@/lib/types";
 
 interface EventTimelineProps {
   events: AgentEvent[];
@@ -64,6 +65,104 @@ function papersFromEvent(event: AgentEvent): PaperResult[] {
   return Array.isArray(papers) ? papers.filter(isPaper) : [];
 }
 
+function toRetrievalHit(value: JsonValue): RetrievalHit | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, JsonValue>;
+  if (typeof record.text !== "string" || typeof record.paper_id !== "string") return null;
+  const strings = (field: JsonValue | undefined): string[] =>
+    Array.isArray(field) ? field.filter((item): item is string => typeof item === "string") : [];
+  return {
+    rank: typeof record.rank === "number" ? record.rank : 0,
+    paper_id: record.paper_id,
+    paper_title: typeof record.paper_title === "string" ? record.paper_title : null,
+    section_path: strings(record.section_path),
+    semantic_role: typeof record.semantic_role === "string" ? record.semantic_role : null,
+    block_types: strings(record.block_types),
+    object_labels: strings(record.object_labels),
+    page_start: typeof record.page_start === "number" ? record.page_start : null,
+    page_end: typeof record.page_end === "number" ? record.page_end : null,
+    text: record.text,
+    figure_asset: typeof record.figure_asset === "string" ? record.figure_asset : null,
+    figure_caption: typeof record.figure_caption === "string" ? record.figure_caption : null,
+    raw_asset_ref: typeof record.raw_asset_ref === "string" ? record.raw_asset_ref : null,
+    table_rows: Array.isArray(record.table_rows)
+      ? record.table_rows.map((row) =>
+          Array.isArray(row) ? row.filter((cell): cell is string => typeof cell === "string") : [],
+        )
+      : null,
+  };
+}
+
+function hitsFromEvent(event: AgentEvent): RetrievalHit[] {
+  const hits = event.payload.hits;
+  if (!Array.isArray(hits)) return [];
+  return hits
+    .map(toRetrievalHit)
+    .filter((hit): hit is RetrievalHit => hit !== null);
+}
+
+function HitTable({ rows }: { rows: string[][] }) {
+  if (rows.length === 0) return null;
+  const width = Math.max(...rows.map((row) => row.length));
+  const header = rows[0] ?? [];
+  const body = rows.slice(1);
+  return (
+    <div className="table-scroll">
+      <table className="structured-table">
+        <thead>
+          <tr>
+            {Array.from({ length: width }, (_, index) => (
+              <th key={index}>{header[index] ?? ""}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {body.map((row, rowIndex) => (
+            <tr key={rowIndex}>
+              {Array.from({ length: width }, (_, index) => (
+                <td key={index}>{row[index] ?? ""}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function HitEvidence({ hit }: { hit: RetrievalHit }) {
+  const tableRows = Array.isArray(hit.table_rows) ? hit.table_rows : null;
+  const isTable = hit.block_types?.includes("table") && tableRows !== null && tableRows.length > 0;
+  const figureSrc =
+    typeof hit.figure_asset === "string"
+      ? hit.figure_asset
+      : typeof hit.raw_asset_ref === "string"
+        ? hit.raw_asset_ref
+        : null;
+  const isFigure = hit.block_types?.includes("figure") && figureSrc !== null;
+  return (
+    <div className="evidence-item">
+      <div className="evidence-meta">
+        <span className="evidence-rank">#{hit.rank}</span>
+        {hit.paper_title ? <span>{hit.paper_title}</span> : null}
+        {hit.page_start != null ? <span>P{hit.page_start}</span> : null}
+      </div>
+      {isFigure ? (
+        <figure className="figure-block">
+          <img
+            alt={hit.figure_caption ?? "figure"}
+            loading="lazy"
+            src={assetUrl(hit.paper_id, figureSrc as string)}
+          />
+          {hit.figure_caption ? <figcaption>{hit.figure_caption}</figcaption> : null}
+        </figure>
+      ) : null}
+      {isTable ? <HitTable rows={tableRows as string[][]} /> : null}
+      {!isFigure && !isTable ? <p className="evidence-text">{hit.text}</p> : null}
+    </div>
+  );
+}
+
 function eventLabel(event: AgentEvent): string {
   switch (event.type) {
     case "run.started":
@@ -99,7 +198,8 @@ function eventLabel(event: AgentEvent): string {
         return [
           `向量召回 ${readNumber(event.payload, "initial_hit_count") ?? 0}`,
           `树扩展 ${readNumber(event.payload, "expanded_candidate_count") ?? 0}`,
-          `rerank 返回 ${readNumber(event.payload, "hit_count") ?? 0}`,
+          `MMR ${readNumber(event.payload, "mmr_candidate_count") ?? 0}`,
+          `最终证据 ${readNumber(event.payload, "hit_count") ?? 0}`,
         ].join(" · ");
       }
       return `工具返回 ${readNumber(event.payload, "result_count") ?? 0} 篇论文`;
@@ -161,13 +261,33 @@ function EventDetails({ event }: { event: AgentEvent }) {
     event.type === "tool.completed" &&
     readString(event.payload, "tool_name") === "retrieve_indexed_paper"
   ) {
+    const rerankerApplied = readBoolean(event.payload, "reranker_applied");
+    const rerankerName = readString(event.payload, "reranker_name");
+    const rerankerError = readString(event.payload, "reranker_error");
+    const hits = hitsFromEvent(event);
     return (
       <div className="event-details">
         <DetailGroup label="RAG 流程" values={[
           `向量初始召回：${readNumber(event.payload, "initial_hit_count") ?? 0}`,
           `树结构扩展候选：${readNumber(event.payload, "expanded_candidate_count") ?? 0}`,
-          `混合 rerank 最终证据：${readNumber(event.payload, "hit_count") ?? 0}`,
+          `正文去重后：${readNumber(event.payload, "deduplicated_candidate_count") ?? 0}`,
+          `MMR 多样性候选：${readNumber(event.payload, "mmr_candidate_count") ?? 0}`,
+          `最终证据：${readNumber(event.payload, "hit_count") ?? 0}`,
         ]} />
+        <DetailGroup label="精排" values={[
+          rerankerApplied
+            ? `Cross-Encoder：${rerankerName ?? "已启用"}`
+            : rerankerName
+              ? `已回退到 parent-aware 排序：${rerankerError ?? "精排未执行"}`
+              : "未配置 Cross-Encoder，使用 parent-aware 排序",
+        ]} />
+        {hits.length > 0 ? (
+          <div className="evidence-list">
+            {hits.map((hit) => (
+              <HitEvidence hit={hit} key={`${hit.paper_id}-${hit.rank}`} />
+            ))}
+          </div>
+        ) : null}
       </div>
     );
   }

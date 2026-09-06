@@ -1,9 +1,10 @@
 import asyncio
 import math
 import re
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, replace
 
-from app.domain.ports import TextEmbeddingGateway, TreeVectorStore
+from app.domain.ports import TextEmbeddingGateway, TextRerankerGateway, TreeVectorStore
 from app.domain.rag import (
     IndexedTreeNode,
     RetrievalHit,
@@ -24,6 +25,9 @@ class _Candidate:
     expanded_from: str | None = None
     paper_score: float = 0.0
     section_score: float = 0.0
+    paper_title: str | None = None
+    embedding: list[float] | None = None
+    rerank_score: float | None = None
 
 
 class TreeRagRetriever:
@@ -34,16 +38,19 @@ class TreeRagRetriever:
         *,
         embedder: TextEmbeddingGateway,
         vector_store: TreeVectorStore,
+        reranker: TextRerankerGateway | None = None,
         initial_top_k: int = 12,
         final_top_k: int = 8,
         max_expanded_per_hit: int = 8,
         max_candidates: int = 40,
-        max_chunks_per_paper: int = 8,
+        max_chunks_per_paper: int = 3,
         paper_top_k: int = 5,
         sections_per_paper: int = 3,
         global_fallback_top_k: int = 6,
         min_ranking_score: float = 0.20,
         score_window: float = 0.18,
+        mmr_top_k: int = 30,
+        mmr_lambda: float = 0.70,
     ) -> None:
         limits = {
             "initial_top_k": initial_top_k,
@@ -54,6 +61,7 @@ class TreeRagRetriever:
             "paper_top_k": paper_top_k,
             "sections_per_paper": sections_per_paper,
             "global_fallback_top_k": global_fallback_top_k,
+            "mmr_top_k": mmr_top_k,
         }
         if any(value < 1 for value in limits.values()):
             raise ValueError("All retrieval limits must be positive")
@@ -61,8 +69,11 @@ class TreeRagRetriever:
             raise ValueError("min_ranking_score must be between -1 and 1")
         if score_window < 0:
             raise ValueError("score_window cannot be negative")
+        if not 0.0 <= mmr_lambda <= 1.0:
+            raise ValueError("mmr_lambda must be between 0 and 1")
         self._embedder = embedder
         self._vector_store = vector_store
+        self._reranker = reranker
         self._initial_top_k = initial_top_k
         self._final_top_k = final_top_k
         self._max_expanded_per_hit = max_expanded_per_hit
@@ -73,6 +84,8 @@ class TreeRagRetriever:
         self._global_fallback_top_k = global_fallback_top_k
         self._min_ranking_score = min_ranking_score
         self._score_window = score_window
+        self._mmr_top_k = mmr_top_k
+        self._mmr_lambda = mmr_lambda
 
     async def retrieve(
         self,
@@ -187,12 +200,17 @@ class TreeRagRetriever:
             reverse=True,
         )[: self._max_candidates]
         ranked = self._filter_weak_candidates(ranked)
-        diversified = self._enforce_paper_cap(ranked)[: self._final_top_k]
+        deduplicated = self._deduplicate_normalized_text(ranked)
+        capped = self._enforce_paper_cap(deduplicated)
+        mmr_selected = self._mmr_select(capped)[: self._mmr_top_k]
+        reranked, reranker_error = await self._rerank_candidates(query, mmr_selected)
+        diversified = reranked[: self._final_top_k]
         hits = [
             RetrievalHit(
                 rank=rank,
                 node_id=candidate.node.node_id,
                 paper_id=candidate.node.paper_id,
+                paper_title=candidate.paper_title,
                 section_path=candidate.node.section_path,
                 semantic_role=candidate.node.semantic_role,
                 block_types=candidate.node.block_types,
@@ -202,8 +220,14 @@ class TreeRagRetriever:
                 text=candidate.node.text,
                 vector_score=candidate.vector_score,
                 ranking_score=ranking_score,
+                rerank_score=candidate.rerank_score,
                 source=candidate.source,
                 expanded_from=candidate.expanded_from,
+                figure_asset=candidate.node.figure_asset,
+                figure_caption=candidate.node.figure_caption,
+                raw_asset_ref=candidate.node.raw_asset_ref,
+                table_rows=candidate.node.table_rows,
+                spans=candidate.node.spans,
             )
             for rank, (candidate, ranking_score) in enumerate(diversified, start=1)
         ]
@@ -215,6 +239,13 @@ class TreeRagRetriever:
             candidate_paper_ids=candidate_paper_ids,
             initial_hit_count=len(hierarchical_matches) + len(fallback_matches),
             expanded_candidate_count=expanded_count,
+            deduplicated_candidate_count=len(deduplicated),
+            mmr_candidate_count=len(mmr_selected),
+            reranker_name=self._reranker.name if self._reranker is not None else None,
+            reranker_applied=(
+                self._reranker is not None and reranker_error is None and bool(mmr_selected)
+            ),
+            reranker_error=reranker_error,
             hits=hits,
         )
 
@@ -251,6 +282,7 @@ class TreeRagRetriever:
         for node_id, candidate in list(candidates.items()):
             parent = by_id.get(candidate.node.parent_id or "")
             root = roots.get(candidate.node.paper_id)
+            indexed_candidate = by_id.get(candidate.node.node_id)
             candidates[node_id] = _Candidate(
                 node=candidate.node,
                 vector_score=candidate.vector_score,
@@ -265,6 +297,12 @@ class TreeRagRetriever:
                     self._cosine_similarity(query_embedding, parent.embedding)
                     if parent is not None
                     else 0.0
+                ),
+                paper_title=root.node.title if root is not None else None,
+                embedding=(
+                    list(indexed_candidate.embedding)
+                    if indexed_candidate is not None
+                    else None
                 ),
             )
 
@@ -342,6 +380,93 @@ class TreeRagRetriever:
             counts[candidate.node.paper_id] = count + 1
         return selected
 
+    @classmethod
+    def _deduplicate_normalized_text(
+        cls,
+        candidates: list[tuple[_Candidate, float]],
+    ) -> list[tuple[_Candidate, float]]:
+        seen: set[str] = set()
+        selected: list[tuple[_Candidate, float]] = []
+        for item in candidates:
+            normalized = cls._normalize_text(item[0].node.text)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            selected.append(item)
+        return selected
+
+    def _mmr_select(
+        self,
+        candidates: list[tuple[_Candidate, float]],
+    ) -> list[tuple[_Candidate, float]]:
+        if len(candidates) < 2:
+            return list(candidates)
+        scores = [score for _, score in candidates]
+        low = min(scores)
+        high = max(scores)
+
+        def normalized_relevance(score: float) -> float:
+            return 1.0 if math.isclose(high, low) else (score - low) / (high - low)
+
+        remaining = list(candidates)
+        selected: list[tuple[_Candidate, float]] = []
+        while remaining and len(selected) < self._mmr_top_k:
+            best = max(
+                remaining,
+                key=lambda item: (
+                    self._mmr_lambda * normalized_relevance(item[1])
+                    - (1.0 - self._mmr_lambda)
+                    * max(
+                        (
+                            self._candidate_similarity(item[0], chosen[0])
+                            for chosen in selected
+                        ),
+                        default=0.0,
+                    )
+                ),
+            )
+            selected.append(best)
+            remaining.remove(best)
+        return selected
+
+    async def _rerank_candidates(
+        self,
+        query: str,
+        candidates: list[tuple[_Candidate, float]],
+    ) -> tuple[list[tuple[_Candidate, float]], str | None]:
+        if self._reranker is None or not candidates:
+            return candidates, None
+        documents = [
+            "\n".join(
+                [
+                    candidate.paper_title or candidate.node.paper_id,
+                    *candidate.node.section_path,
+                    candidate.node.text,
+                ]
+            )
+            for candidate, _ in candidates
+        ]
+        try:
+            scores = await self._reranker.rerank(query, documents)
+            if len(scores) != len(candidates):
+                raise ValueError("Reranker score count does not match candidate count")
+        except (RuntimeError, ValueError, TypeError) as error:
+            return candidates, str(error)
+        reranked = [
+            (replace(candidate, rerank_score=score), score)
+            for (candidate, _), score in zip(candidates, scores, strict=True)
+        ]
+        return sorted(reranked, key=lambda item: item[1], reverse=True), None
+
+    @classmethod
+    def _candidate_similarity(cls, left: _Candidate, right: _Candidate) -> float:
+        if left.embedding is not None and right.embedding is not None:
+            return max(0.0, cls._cosine_similarity(left.embedding, right.embedding))
+        left_terms = cls._terms(left.node.text)
+        right_terms = cls._terms(right.node.text)
+        union = left_terms | right_terms
+        return len(left_terms & right_terms) / len(union) if union else 0.0
+
     def _filter_weak_candidates(
         self,
         candidates: list[tuple[_Candidate, float]],
@@ -379,6 +504,12 @@ class TreeRagRetriever:
         }
         chinese_characters = set(re.findall(r"[\u4e00-\u9fff]", text))
         return latin_terms | chinese_characters
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        normalized = unicodedata.normalize("NFKC", text).casefold()
+        normalized = re.sub(r"-\s*\n\s*", "", normalized)
+        return re.sub(r"\s+", " ", normalized).strip()
 
     @staticmethod
     def _cosine_similarity(left: list[float], right: list[float]) -> float:

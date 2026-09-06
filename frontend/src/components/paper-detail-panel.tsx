@@ -2,18 +2,20 @@
 
 import { useMemo, useState } from "react";
 
+import { assetUrl, pdfUrl } from "@/lib/api";
 import type { IndexedPaperDetail, PaperTreeNode } from "@/lib/types";
 
 interface PaperDetailPanelProps {
   deleteDisabled: boolean;
   detail: IndexedPaperDetail;
+  focusPage?: number | null;
   isDeleting: boolean;
   onClose: () => void;
   onDelete: () => void;
 }
 
 type NodeFilter = "all" | "section" | "chunk";
-type PanelTab = "index" | "about";
+type PanelTab = "index" | "about" | "pdf";
 
 function pageLabel(node: PaperTreeNode): string {
   if (node.page_start === null) return "";
@@ -85,16 +87,66 @@ function matchesNode(node: PaperTreeNode, filter: NodeFilter, query: string): bo
   return haystack.includes(query.toLocaleLowerCase());
 }
 
+function TableView({ rows }: { rows: string[][] }) {
+  if (rows.length === 0) return null;
+  const width = Math.max(...rows.map((row) => row.length));
+  const header = rows[0] ?? [];
+  const body = rows.slice(1);
+  return (
+    <div className="table-scroll">
+      <table className="structured-table">
+        <thead>
+          <tr>
+            {Array.from({ length: width }, (_, index) => (
+              <th key={index}>{header[index] ?? ""}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {body.map((row, rowIndex) => (
+            <tr key={rowIndex}>
+              {Array.from({ length: width }, (_, index) => (
+                <td key={index}>{row[index] ?? ""}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function NodeContent({ node, paperId }: { node: PaperTreeNode; paperId: string }) {
+  const figureSrc = node.figure_asset ?? node.raw_asset_ref ?? null;
+  if (node.block_types.includes("figure") && figureSrc) {
+    return (
+      <figure className="figure-block">
+        <img
+          alt={node.figure_caption ?? node.title}
+          loading="lazy"
+          src={assetUrl(paperId, figureSrc)}
+        />
+        <figcaption>{node.figure_caption ?? node.text}</figcaption>
+      </figure>
+    );
+  }
+  if (node.block_types.includes("table") && node.table_rows && node.table_rows.length > 0) {
+    return <TableView rows={node.table_rows} />;
+  }
+  return <div className="node-content">{node.text || node.text_preview}</div>;
+}
+
 export function PaperDetailPanel({
   deleteDisabled,
   detail,
+  focusPage,
   isDeleting,
   onClose,
   onDelete,
 }: PaperDetailPanelProps) {
   const initialNode =
     detail.nodes.find((node) => node.node_type === "chunk") ?? detail.nodes[0] ?? null;
-  const [tab, setTab] = useState<PanelTab>("index");
+  const [tab, setTab] = useState<PanelTab>(focusPage != null ? "pdf" : "index");
   const [filter, setFilter] = useState<NodeFilter>("all");
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState(initialNode?.node_id ?? "");
@@ -137,6 +189,7 @@ export function PaperDetailPanel({
           <div className="paper-detail-actions">
             <div className="paper-tabs" role="tablist" aria-label="论文详情视图">
               <button aria-selected={tab === "index"} className={tab === "index" ? "active" : ""} onClick={() => setTab("index")} role="tab" type="button">索引与 Chunk</button>
+              <button aria-selected={tab === "pdf"} className={tab === "pdf" ? "active" : ""} onClick={() => setTab("pdf")} role="tab" type="button">原文 PDF</button>
               <button aria-selected={tab === "about"} className={tab === "about" ? "active" : ""} onClick={() => setTab("about")} role="tab" type="button">论文信息</button>
             </div>
             <button
@@ -197,10 +250,18 @@ export function PaperDetailPanel({
                     {selectedNode.block_types.map((type) => <span key={type}>{type}</span>)}
                     {selectedNode.object_labels.map((label) => <span key={label}>#{label}</span>)}
                   </div>
-                  <div className="node-content">{selectedNode.text || selectedNode.text_preview}</div>
+                  <NodeContent node={selectedNode} paperId={detail.paper.paper_id} />
                 </>
               ) : <p className="empty">该论文没有可显示的索引节点。</p>}
             </article>
+          </div>
+        ) : tab === "pdf" ? (
+          <div className="paper-pdf-viewer hidden-scrollbar">
+            <iframe
+              className="paper-pdf-frame"
+              src={pdfUrl(detail.paper.paper_id) + (focusPage != null ? `#page=${focusPage}` : "")}
+              title={`${detail.paper.title} PDF`}
+            />
           </div>
         ) : (
           <div className="paper-overview hidden-scrollbar">

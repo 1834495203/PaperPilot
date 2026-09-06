@@ -322,6 +322,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             session.add(row)
             await session.commit()
 
+    async def delete_messages_from(self, conversation_id: UUID, sequence: int) -> None:
+        async with self._session_factory() as session:
+            await session.execute(
+                delete(MessageRow).where(
+                    MessageRow.conversation_id == str(conversation_id),
+                    MessageRow.sequence >= sequence,
+                )
+            )
+            await session.commit()
+
+    async def delete_run(self, run_id: UUID) -> None:
+        run_key = str(run_id)
+        async with self._session_factory() as session:
+            await session.execute(delete(ToolCallRow).where(ToolCallRow.run_id == run_key))
+            await session.execute(delete(AgentEventRow).where(AgentEventRow.run_id == run_key))
+            await session.execute(delete(AgentRunRow).where(AgentRunRow.id == run_key))
+            await session.commit()
+
     @staticmethod
     def _to_conversation(row: ConversationRow) -> Conversation:
         return Conversation(

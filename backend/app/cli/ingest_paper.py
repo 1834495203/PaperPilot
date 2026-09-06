@@ -31,7 +31,10 @@ async def _run() -> None:
     settings = get_settings()
     service = PaperIngestionService(
         parser=PypdfScientificPaperParser(),
-        chunker=TreeRagChunker(max_chunk_chars=settings.tree_chunk_max_chars),
+        chunker=TreeRagChunker(
+            max_chunk_chars=settings.tree_chunk_max_chars,
+            overlap_sentences=settings.tree_chunk_overlap_sentences,
+        ),
         embedder=OpenAITextEmbeddingGateway(
             model=settings.embedding_model,
             api_key=settings.embedding_api_key,

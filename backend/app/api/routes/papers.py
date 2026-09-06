@@ -1,6 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse
 
 from app.api.dependencies import get_paper_library
 from app.api.schemas import (
@@ -82,6 +83,42 @@ async def delete_paper(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Paper deletion failed: {error}",
         ) from error
+
+
+@router.get("/{paper_id}/pdf")
+async def get_paper_pdf(
+    paper_id: str,
+    service: Annotated[PaperLibraryService, Depends(get_paper_library)],
+) -> FileResponse:
+    try:
+        path = service.get_pdf_path(paper_id)
+    except PaperNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Paper PDF not found",
+        ) from error
+    return FileResponse(path, media_type="application/pdf")
+
+
+@router.get("/{paper_id}/assets/{filename}")
+async def get_paper_asset(
+    paper_id: str,
+    filename: str,
+    service: Annotated[PaperLibraryService, Depends(get_paper_library)],
+) -> FileResponse:
+    try:
+        path = service.get_asset_path(paper_id, filename)
+    except PaperNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Asset not found",
+        ) from error
+    if not path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Asset not found",
+        )
+    return FileResponse(path)
 
 
 @router.post("/retrieve", response_model=TreeRetrievalResponse)

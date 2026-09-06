@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from app.domain.ports import ScientificPaperParser, TextEmbeddingGateway, TreeVectorStore
 from app.domain.rag import PaperIngestionResult, TreeNodeType
 from app.infrastructure.rag.tree_chunker import TreeRagChunker
@@ -23,8 +25,11 @@ class PaperIngestionService:
         *,
         paper_id: str,
         title: str | None = None,
+        asset_dir: Path | None = None,
     ) -> PaperIngestionResult:
-        document = await self._parser.parse(path, paper_id=paper_id, title=title)
+        document = await self._parser.parse(
+            path, paper_id=paper_id, title=title, asset_dir=asset_dir
+        )
         nodes = self._chunker.chunk(document)
         embeddings = await self._embedder.embed_documents(
             [node.embedding_text for node in nodes]

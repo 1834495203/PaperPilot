@@ -16,7 +16,11 @@ from app.api.schemas import (
     MessageResponse,
     SendMessageRequest,
 )
-from app.application.chat_service import ChatService, ConversationNotFoundError
+from app.application.chat_service import (
+    ChatService,
+    ConversationNotFoundError,
+    MessageNotFoundError,
+)
 from app.application.paper_library import PaperLibraryService
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -135,6 +139,43 @@ async def cancel_run(
             status_code=status.HTTP_409_CONFLICT,
             detail="Run is not active",
         )
+
+
+@router.post("/{conversation_id}/messages/{message_id}/regenerate")
+async def regenerate_message(
+    conversation_id: UUID,
+    message_id: UUID,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+    paper_library: Annotated[PaperLibraryService, Depends(get_paper_library)],
+) -> StreamingResponse:
+    local_corpus_available = bool(await paper_library.list_papers())
+
+    async def event_stream() -> AsyncIterator[str]:
+        try:
+            async for event in service.regenerate_message(
+                conversation_id,
+                message_id,
+                local_corpus_available=local_corpus_available,
+            ):
+                response = EventResponse.from_domain(event)
+                data = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
+                yield f"id: {event.sequence}\nevent: {event.type.value}\ndata: {data}\n\n"
+        except ConversationNotFoundError:
+            error_data = json.dumps({"error": "Conversation not found"})
+            yield f"event: run.failed\ndata: {error_data}\n\n"
+        except MessageNotFoundError:
+            error_data = json.dumps({"error": "Message not found"})
+            yield f"event: run.failed\ndata: {error_data}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/{conversation_id}/messages/stream")

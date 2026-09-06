@@ -26,6 +26,7 @@ class _Ingestion:
         *,
         paper_id: str,
         title: str | None = None,
+        asset_dir: Path | None = None,
     ) -> PaperIngestionResult:
         return PaperIngestionResult(
             paper_id=paper_id,
@@ -203,3 +204,33 @@ async def test_retrieval_rejects_unknown_library_paper(tmp_path: Path) -> None:
             paper_ids=["missing"],
             mode=RetrievalMode.FACT,
         )
+
+
+def test_get_asset_path_validates_and_resolves(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+
+    good = service.get_asset_path("paper-abc123", "fig-0001-00.png")
+    assert good == (tmp_path / "papers" / "paper-abc123.assets" / "fig-0001-00.png").resolve()
+
+    with pytest.raises(PaperNotFoundError):
+        service.get_asset_path("paper-abc123", "../secret.png")
+    with pytest.raises(PaperNotFoundError):
+        service.get_asset_path("paper-abc123", "sub/dir.png")
+    with pytest.raises(PaperNotFoundError):
+        service.get_asset_path("bad paper id!", "fig.png")
+
+
+def test_get_pdf_path_resolves_managed_pdf(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    pdf = tmp_path / "papers" / "paper-abc123.pdf"
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+    pdf.write_bytes(b"%PDF-1.7\n")
+
+    resolved = service.get_pdf_path("paper-abc123")
+    assert resolved.name == "paper-abc123.pdf"
+    assert resolved.is_file()
+
+    with pytest.raises(PaperNotFoundError):
+        service.get_pdf_path("missing-paper")
+    with pytest.raises(PaperNotFoundError):
+        service.get_pdf_path("bad id!")

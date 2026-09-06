@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import dataclass
 from time import perf_counter
@@ -15,7 +16,7 @@ from app.application.tree_retrieval import TreeRagRetriever
 from app.domain.enums import EventType
 from app.domain.papers import Paper, PdfDocument
 from app.domain.ports import PaperDocumentGateway
-from app.domain.rag import RetrievalMode, TreeRetrievalReport
+from app.domain.rag import Evidence, EvidenceLibrary, RetrievalMode, TreeRetrievalReport
 from app.domain.types import JsonValue
 from app.infrastructure.agent.recording import AgentExecutionRecorder
 from app.infrastructure.agent.supervisor.model_gateway import AgentModelGateway, ModelUsage
@@ -417,8 +418,12 @@ class ReaderAgentGraph:
             [SystemMessage(content=READER_PROMPT), HumanMessage(content=prompt)],
             ReadingReport,
         )
+        report = self._validate_evidence_references(
+            result.value,
+            self._evidence_library(state),
+        )
         return {
-            "final_report": result.value,
+            "final_report": report,
             **self._usage_update(state, result.usage),
         }
 
@@ -464,6 +469,7 @@ class ReaderAgentGraph:
 
     @staticmethod
     def _reading_material(state: ReaderState) -> str:
+        evidence_library = ReaderAgentGraph._evidence_library(state)
         if state["retrieval_reports"]:
             return json.dumps(
                 {
@@ -478,12 +484,27 @@ class ReaderAgentGraph:
                         else None
                     ),
                     "retrieval_rounds": [
-                        report.model_dump(mode="json") for report in state["retrieval_reports"]
+                        {
+                            "query": report.query,
+                            "mode": report.mode.value,
+                            "candidate_paper_ids": report.candidate_paper_ids,
+                            "initial_hit_count": report.initial_hit_count,
+                            "expanded_candidate_count": report.expanded_candidate_count,
+                            "deduplicated_candidate_count": (
+                                report.deduplicated_candidate_count
+                            ),
+                            "mmr_candidate_count": report.mmr_candidate_count,
+                            "reranker_name": report.reranker_name,
+                            "reranker_applied": report.reranker_applied,
+                            "reranker_error": report.reranker_error,
+                        }
+                        for report in state["retrieval_reports"]
                     ],
+                    "evidence_library": evidence_library.model_dump(mode="json"),
                     "instruction": (
                         "Treat paper_metadata as authoritative bibliographic metadata. "
-                        "Use only retrieved chunks as evidence for substantive claims and "
-                        "preserve page numbers and section paths in evidence entries."
+                        "Use only Evidence Library entries for substantive claims and copy "
+                        "their exact evidence IDs into report evidence entries."
                     ),
                 },
                 ensure_ascii=False,
@@ -502,7 +523,7 @@ class ReaderAgentGraph:
                         "truncated": document.truncated,
                         "warnings": document.extraction_warnings,
                     },
-                    "full_text": document.text,
+                    "evidence_library": evidence_library.model_dump(mode="json"),
                 },
                 ensure_ascii=False,
             )
@@ -510,6 +531,7 @@ class ReaderAgentGraph:
             {
                 "paper_metadata": state["local_metadata"],
                 "paper": candidate.paper.model_dump(mode="json") if candidate else None,
+                "evidence_library": evidence_library.model_dump(mode="json"),
             },
             ensure_ascii=False,
         )
@@ -517,6 +539,95 @@ class ReaderAgentGraph:
             f"{material}\n\nMaterial retrieval failed: {state['material_error']}"
             if state["material_error"]
             else material
+        )
+
+    @staticmethod
+    def _evidence_library(state: ReaderState) -> EvidenceLibrary:
+        evidence: list[Evidence] = []
+        seen_chunks: set[str] = set()
+        for report in state["retrieval_reports"]:
+            for hit in report.hits:
+                if hit.node_id in seen_chunks:
+                    continue
+                seen_chunks.add(hit.node_id)
+                evidence.append(
+                    Evidence(
+                        evidence_id=ReaderAgentGraph._evidence_id(hit.node_id),
+                        paper_id=hit.paper_id,
+                        paper_title=hit.paper_title or hit.paper_id,
+                        chunk_id=hit.node_id,
+                        section_path=hit.section_path,
+                        page_start=hit.page_start,
+                        page_end=hit.page_end,
+                        raw_text=hit.text,
+                        evidence_text=hit.text,
+                        retrieval_score=hit.ranking_score,
+                        rerank_score=hit.rerank_score,
+                        spans=hit.spans,
+                    )
+                )
+        document = state["pdf_document"]
+        candidate = state["pdf_candidate"]
+        if not evidence and document is not None:
+            paper_id = candidate.paper.paper_id if candidate is not None else "external-paper"
+            title = candidate.paper.title if candidate is not None else paper_id
+            evidence.append(
+                Evidence(
+                    evidence_id=ReaderAgentGraph._evidence_id(
+                        f"{paper_id}:pdf-extraction"
+                    ),
+                    paper_id=paper_id,
+                    paper_title=title,
+                    chunk_id=f"{paper_id}:pdf-extraction",
+                    section_path=[],
+                    page_start=1,
+                    page_end=document.extracted_pages or None,
+                    raw_text=document.text,
+                    evidence_text=document.text,
+                    retrieval_score=1.0,
+                )
+            )
+        if not evidence and state["local_metadata"] is not None:
+            metadata_text = json.dumps(state["local_metadata"], ensure_ascii=False)
+            paper_id = state["task"].paper_id or "local-metadata"
+            title_value = state["local_metadata"].get("title", paper_id)
+            title = title_value if isinstance(title_value, str) else paper_id
+            evidence.append(
+                Evidence(
+                    evidence_id=ReaderAgentGraph._evidence_id(f"{paper_id}:metadata"),
+                    paper_id=paper_id,
+                    paper_title=title,
+                    chunk_id=f"{paper_id}:metadata",
+                    section_path=[],
+                    raw_text=metadata_text,
+                    evidence_text=metadata_text,
+                    retrieval_score=1.0,
+                )
+            )
+        return EvidenceLibrary(objective=state["task"].objective, evidence=evidence)
+
+    @staticmethod
+    def _evidence_id(chunk_id: str) -> str:
+        return f"E-{hashlib.sha256(chunk_id.encode('utf-8')).hexdigest()[:12]}"
+
+    @staticmethod
+    def _validate_evidence_references(
+        report: ReadingReport,
+        library: EvidenceLibrary,
+    ) -> ReadingReport:
+        valid_ids = {item.evidence_id for item in library.evidence}
+        valid_evidence = [item for item in report.evidence if item.evidence_id in valid_ids]
+        invalid_count = len(report.evidence) - len(valid_evidence)
+        if invalid_count == 0:
+            return report
+        return report.model_copy(
+            update={
+                "evidence": valid_evidence,
+                "limitations": [
+                    *report.limitations,
+                    f"Removed {invalid_count} evidence reference(s) not present in the library",
+                ][:8],
+            }
         )
 
     async def _fetch_pdf(
@@ -611,9 +722,36 @@ class ReaderAgentGraph:
                     "tool_name": "retrieve_indexed_paper",
                     "initial_hit_count": report.initial_hit_count,
                     "expanded_candidate_count": report.expanded_candidate_count,
+                    "deduplicated_candidate_count": report.deduplicated_candidate_count,
+                    "mmr_candidate_count": report.mmr_candidate_count,
+                    "reranker_name": report.reranker_name,
+                    "reranker_applied": report.reranker_applied,
+                    "reranker_error": report.reranker_error,
                     "hit_count": len(report.hits),
                     "searched_globally": report.searched_globally,
                     "candidate_paper_ids": cast(JsonValue, report.candidate_paper_ids),
+                    "hits": cast(
+                        JsonValue,
+                        [
+                            {
+                                "rank": hit.rank,
+                                "paper_id": hit.paper_id,
+                                "paper_title": hit.paper_title,
+                                "section_path": hit.section_path,
+                                "semantic_role": hit.semantic_role,
+                                "block_types": [item.value for item in hit.block_types],
+                                "object_labels": hit.object_labels,
+                                "page_start": hit.page_start,
+                                "page_end": hit.page_end,
+                                "text": hit.text,
+                                "figure_asset": hit.figure_asset,
+                                "figure_caption": hit.figure_caption,
+                                "raw_asset_ref": hit.raw_asset_ref,
+                                "table_rows": hit.table_rows,
+                            }
+                            for hit in report.hits
+                        ],
+                    ),
                     "duration_ms": int((perf_counter() - started) * 1000),
                 },
             )
@@ -626,6 +764,11 @@ class ReaderAgentGraph:
             {
                 "initial_hit_count": report.initial_hit_count,
                 "expanded_candidate_count": report.expanded_candidate_count,
+                "deduplicated_candidate_count": report.deduplicated_candidate_count,
+                "mmr_candidate_count": report.mmr_candidate_count,
+                "reranker_name": report.reranker_name,
+                "reranker_applied": report.reranker_applied,
+                "reranker_error": report.reranker_error,
                 "hit_count": len(report.hits),
                 "searched_globally": report.searched_globally,
                 "candidate_paper_ids": cast(JsonValue, report.candidate_paper_ids),
@@ -799,6 +942,7 @@ class ReaderAgentNode:
         attempted_queries = result["attempted_queries"]
         unique_hit_count = self._unique_hit_count(retrieval_reports)
         supervisor_summary = self._compact_summary(report.analysis_summary)
+        evidence_library = ReaderAgentGraph._evidence_library(result)
         artifact = AgentArtifact(
             title=f"Reading report: {report.paper_or_material}",
             supervisor_summary=ReaderAgentSummary(
@@ -816,7 +960,13 @@ class ReaderAgentNode:
                 retrieval_rounds=result["retrieval_attempts"],
                 attempted_queries=attempted_queries,
             ),
-            content=report.model_dump_json(),
+            content=json.dumps(
+                {
+                    "reading_report": report.model_dump(mode="json"),
+                    "evidence_library": evidence_library.model_dump(mode="json"),
+                },
+                ensure_ascii=False,
+            ),
             source_artifact_ids=[item.id for item in selected],
         )
         judgment = result["assessment"]

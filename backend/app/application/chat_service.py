@@ -22,6 +22,10 @@ class ConversationNotFoundError(LookupError):
     pass
 
 
+class MessageNotFoundError(LookupError):
+    pass
+
+
 class ChatService:
     def __init__(self, store: ConversationStore, agent: AgentRunner) -> None:
         self._store = store
@@ -94,6 +98,64 @@ class ChatService:
                 "paper_ids": list(selected_paper_ids),
             },
         )
+        async for event in self._stream_run(
+            conversation_id,
+            run,
+            selected_paper_ids,
+            local_corpus_available,
+        ):
+            yield event
+
+    async def regenerate_message(
+        self,
+        conversation_id: UUID,
+        message_id: UUID,
+        *,
+        local_corpus_available: bool = False,
+    ) -> AsyncIterator[AgentEvent]:
+        await self._require_conversation(conversation_id)
+        messages = await self._store.list_messages(conversation_id)
+        target = next((message for message in messages if message.id == message_id), None)
+        if target is None or target.role is not MessageRole.USER:
+            raise MessageNotFoundError(str(message_id))
+        raw_paper_ids = target.metadata.get("paper_ids")
+        selected_paper_ids = (
+            tuple(dict.fromkeys(str(item) for item in raw_paper_ids))
+            if isinstance(raw_paper_ids, list)
+            else ()
+        )
+        raw_run_id = target.metadata.get("run_id")
+        if isinstance(raw_run_id, str):
+            try:
+                await self._store.delete_run(UUID(raw_run_id))
+            except ValueError:
+                pass
+        await self._store.delete_messages_from(conversation_id, target.sequence)
+        run = await self._store.create_run(conversation_id)
+        await self._store.append_message(
+            conversation_id,
+            MessageRole.USER,
+            target.content,
+            metadata={
+                "run_id": str(run.id),
+                "paper_ids": list(selected_paper_ids),
+            },
+        )
+        async for event in self._stream_run(
+            conversation_id,
+            run,
+            selected_paper_ids,
+            local_corpus_available,
+        ):
+            yield event
+
+    async def _stream_run(
+        self,
+        conversation_id: UUID,
+        run: AgentRun,
+        paper_ids: tuple[str, ...],
+        local_corpus_available: bool,
+    ) -> AsyncIterator[AgentEvent]:
         queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
         publisher = RunEventPublisher(
             run_id=run.id,
@@ -106,7 +168,7 @@ class ChatService:
                 conversation_id=conversation_id,
                 run_id=run.id,
                 publisher=publisher,
-                paper_ids=selected_paper_ids,
+                paper_ids=paper_ids,
                 local_corpus_available=local_corpus_available,
             ),
             name=f"paperpilot-run-{run.id}",
