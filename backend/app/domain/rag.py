@@ -1,7 +1,8 @@
+import hashlib
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
@@ -24,9 +25,34 @@ class RetrievalMode(StrEnum):
         return self is not RetrievalMode.FACT
 
 
+class RetrievalStrategy(StrEnum):
+    """Task-level retrieval strategy; each value owns its own candidate budget."""
+
+    SINGLE_PAPER = "single_paper"
+    MULTI_PAPER = "multi_paper"
+    CORPUS_SURVEY = "corpus_survey"
+
+
 class RetrievalSource(StrEnum):
     VECTOR = "vector"
+    KEYWORD = "keyword"
     TREE_EXPANSION = "tree_expansion"
+
+
+class CoverageStatus(StrEnum):
+    """Outcome of one paper x dimension coverage cell.
+
+    ``CANDIDATE`` means retrieval delivered a chunk for the cell but nothing has
+    verified that it answers the dimension, ``MISSING`` means no evidence was
+    obtained and one may exist, and ``NOT_STATED`` is an evidence-backed verdict
+    that the paper does not address the dimension at all. Only an evidence reader
+    may set ``COVERED`` or ``NOT_STATED``.
+    """
+
+    CANDIDATE = "candidate"
+    COVERED = "covered"
+    MISSING = "missing"
+    NOT_STATED = "not_stated"
 
 
 class PaperBlockType(StrEnum):
@@ -229,6 +255,7 @@ class IndexedPaper(BaseModel):
     section_count: int = Field(ge=0)
     node_count: int = Field(ge=1)
     chunk_count: int = Field(ge=1)
+    index_signature: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @model_validator(mode="before")
@@ -245,6 +272,32 @@ class IndexedPaper(BaseModel):
     @property
     def title(self) -> str:
         return self.metadata.title
+
+
+class PaperIndexStatus(BaseModel):
+    """Whether one indexed paper still matches the current index fingerprint."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    paper_id: str
+    title: str
+    chunk_count: int = Field(ge=0)
+    index_signature: str | None = None
+    current_signature: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def needs_rebuild(self) -> bool:
+        """True only when a recorded fingerprint disagrees with the current one."""
+
+        if self.current_signature is None or self.index_signature is None:
+            return False
+        return self.index_signature != self.current_signature
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def fingerprint_recorded(self) -> bool:
+        return self.index_signature is not None
 
 
 class PaperTreeNodeView(BaseModel):
@@ -292,6 +345,207 @@ class TreeVectorMatch(BaseModel):
     vector_score: float
 
 
+class TreeKeywordMatch(BaseModel):
+    """A hit produced by the lexical channel, independent of vector recall."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    node: TreeIndexNode
+    keyword_score: float = Field(ge=0, le=1)
+    matched_terms: list[str] = Field(default_factory=list)
+
+
+class KeywordSearchResult(BaseModel):
+    """Lexical recall output plus its own bounded-pool diagnostics.
+
+    ``truncated_terms`` lists query terms whose substring filter returned more
+    records than the store fetched, so the pool - and therefore the BM25 term
+    statistics - was incomplete for them.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    matches: list[TreeKeywordMatch] = Field(default_factory=list)
+    pool_size: int = Field(default=0, ge=0)
+    truncated_terms: list[str] = Field(default_factory=list)
+
+
+class RetrievalQuery(BaseModel):
+    """One retrieval sub-question with its own scope, mode and coverage dimension."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    query: str = Field(min_length=1, max_length=2_000)
+    mode: RetrievalMode
+    paper_ids: list[str] = Field(default_factory=list)
+    dimension: str | None = Field(default=None, max_length=200)
+
+
+class RetrievalBudget(BaseModel):
+    """Candidate and evidence budget resolved from the task strategy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_papers: int = Field(ge=1)
+    sections_per_paper: int = Field(ge=1)
+    initial_top_k: int = Field(ge=1)
+    global_fallback_top_k: int = Field(ge=1)
+    keyword_top_k: int = Field(ge=1)
+    max_expanded_per_hit: int = Field(ge=1)
+    rerank_candidate_limit: int = Field(ge=1)
+    max_chunks_per_paper: int = Field(ge=1)
+    final_top_k: int = Field(ge=1)
+
+
+class CoverageCell(BaseModel):
+    """One paper x dimension cell of the multi-paper coverage check.
+
+    ``evidence_ids`` are candidate chunk node IDs delivered by retrieval, while
+    ``verified_evidence_ids`` are Evidence Library IDs that an evidence reader
+    cited to confirm the cell is answered.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    paper_id: str
+    dimension: str
+    status: CoverageStatus
+    evidence_ids: list[str] = Field(default_factory=list)
+    verified_evidence_ids: list[str] = Field(default_factory=list)
+    note: str | None = None
+
+
+class CoverageMatrix(BaseModel):
+    """Paper x dimension coverage of the current evidence set."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    DEFAULT_DIMENSION: ClassVar[str] = "content"
+
+    dimensions: list[str] = Field(default_factory=list)
+    cells: list[CoverageCell] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def paper_ids(self) -> list[str]:
+        return list(dict.fromkeys(cell.paper_id for cell in self.cells))
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def candidate_cell_count(self) -> int:
+        """Cells with a retrieved candidate that no evidence reader has verified."""
+
+        return sum(cell.status is CoverageStatus.CANDIDATE for cell in self.cells)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def covered_cell_count(self) -> int:
+        return sum(cell.status is CoverageStatus.COVERED for cell in self.cells)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def unresolved_cell_count(self) -> int:
+        return sum(cell.status is not CoverageStatus.COVERED for cell in self.cells)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def coverage_ratio(self) -> float:
+        """Verified coverage only; candidate cells do not count as answered."""
+
+        if not self.cells:
+            return 0.0
+        return self.covered_cell_count / len(self.cells)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def candidate_ratio(self) -> float:
+        """Cells where retrieval at least produced something to judge."""
+
+        if not self.cells:
+            return 0.0
+        return (self.covered_cell_count + self.candidate_cell_count) / len(self.cells)
+
+    def cell_for(self, paper_id: str, dimension: str) -> CoverageCell | None:
+        return next(
+            (
+                cell
+                for cell in self.cells
+                if cell.paper_id == paper_id and cell.dimension == dimension
+            ),
+            None,
+        )
+
+    def unresolved_cells(self) -> list[CoverageCell]:
+        return [cell for cell in self.cells if cell.status is not CoverageStatus.COVERED]
+
+    def candidate_cells(self) -> list[CoverageCell]:
+        return [cell for cell in self.cells if cell.status is CoverageStatus.CANDIDATE]
+
+    def with_cell(self, updated: CoverageCell) -> "CoverageMatrix":
+        cells = [
+            updated
+            if cell.paper_id == updated.paper_id and cell.dimension == updated.dimension
+            else cell
+            for cell in self.cells
+        ]
+        if not any(
+            cell.paper_id == updated.paper_id and cell.dimension == updated.dimension
+            for cell in self.cells
+        ):
+            cells.append(updated)
+        dimensions = list(self.dimensions)
+        if updated.dimension not in dimensions:
+            dimensions.append(updated.dimension)
+        return self.model_copy(update={"cells": cells, "dimensions": dimensions})
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        paper_ids: list[str],
+        dimensions: list[str],
+    ) -> "CoverageMatrix":
+        effective_dimensions = dimensions or [cls.DEFAULT_DIMENSION]
+        return cls(
+            dimensions=effective_dimensions,
+            cells=[
+                CoverageCell(
+                    paper_id=paper_id,
+                    dimension=dimension,
+                    status=CoverageStatus.MISSING,
+                )
+                for paper_id in paper_ids
+                for dimension in effective_dimensions
+            ],
+        )
+
+
+class IndexSignature(BaseModel):
+    """Identifies the models and code versions that produced a vector index."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    embedding_model: str = Field(min_length=1)
+    embedding_dimensions: int | None = Field(default=None, ge=1)
+    chunker_version: str = Field(min_length=1)
+    parser_version: str = Field(min_length=1)
+    schema_version: int = Field(default=4, ge=1)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def fingerprint(self) -> str:
+        payload = "|".join(
+            [
+                self.embedding_model,
+                str(self.embedding_dimensions or 0),
+                self.chunker_version,
+                self.parser_version,
+                str(self.schema_version),
+            ]
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 class RetrievalHit(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -309,6 +563,12 @@ class RetrievalHit(BaseModel):
     vector_score: float
     ranking_score: float
     rerank_score: float | None = None
+    rerank_query: str | None = None
+    keyword_score: float | None = None
+    fused_score: float | None = None
+    matched_terms: list[str] = Field(default_factory=list)
+    matched_queries: list[str] = Field(default_factory=list)
+    matched_dimensions: list[str] = Field(default_factory=list)
     source: RetrievalSource
     expanded_from: str | None = None
     figure_asset: str | None = None
@@ -324,12 +584,21 @@ class TreeRetrievalReport(BaseModel):
     query: str
     mode: RetrievalMode
     paper_ids: list[str]
+    strategy: RetrievalStrategy = RetrievalStrategy.SINGLE_PAPER
+    budget: RetrievalBudget | None = None
+    queries: list[RetrievalQuery] = Field(default_factory=list)
     searched_globally: bool = False
     candidate_paper_ids: list[str] = Field(default_factory=list)
+    missing_paper_ids: list[str] = Field(default_factory=list)
+    coverage: CoverageMatrix | None = None
     initial_hit_count: int = Field(ge=0)
     expanded_candidate_count: int = Field(ge=0)
     deduplicated_candidate_count: int = Field(default=0, ge=0)
     mmr_candidate_count: int = Field(default=0, ge=0)
+    keyword_candidate_count: int = Field(default=0, ge=0)
+    keyword_pool_size: int = Field(default=0, ge=0)
+    keyword_truncated_terms: list[str] = Field(default_factory=list)
+    fused_candidate_count: int = Field(default=0, ge=0)
     reranker_name: str | None = None
     reranker_applied: bool = False
     reranker_error: str | None = None

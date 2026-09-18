@@ -2,17 +2,17 @@ import argparse
 import asyncio
 import sys
 
-from app.application.tree_retrieval import TreeRagRetriever
+from app.cli.factories import build_retriever
 from app.config import get_settings
-from app.domain.rag import RetrievalMode
-from app.infrastructure.rag.chroma_store import ChromaTreeVectorStore
-from app.infrastructure.rag.embeddings import OpenAITextEmbeddingGateway
-from app.infrastructure.rag.reranker import SentenceTransformerCrossEncoderReranker
+from app.domain.rag import RetrievalMode, RetrievalQuery, RetrievalStrategy
 
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Retrieve TreeRAG chunks from the local Chroma paper index."
+        description=(
+            "Retrieve TreeRAG chunks from the local Chroma paper index using one query "
+            "or an explicit sub-question plan."
+        )
     )
     parser.add_argument("query", help="Question or retrieval query")
     parser.add_argument(
@@ -27,50 +27,68 @@ def _arguments() -> argparse.Namespace:
         choices=[item.value for item in RetrievalMode],
         default=RetrievalMode.FACT.value,
     )
+    parser.add_argument(
+        "--strategy",
+        choices=[item.value for item in RetrievalStrategy],
+        default=None,
+        help="Retrieval task strategy; omitted means the retriever infers it",
+    )
+    parser.add_argument(
+        "--sub-question",
+        action="append",
+        dest="sub_questions",
+        default=[],
+        metavar="DIMENSION=QUERY",
+        help=(
+            "Additional sub-question as DIMENSION=QUERY; repeat once per paper x "
+            "dimension to retrieve a multi-paper comparison"
+        ),
+    )
+    parser.add_argument(
+        "--sub-mode",
+        choices=[item.value for item in RetrievalMode],
+        default=RetrievalMode.METHOD.value,
+        help="Retrieval mode applied to every --sub-question",
+    )
+    parser.add_argument(
+        "--global",
+        action="store_true",
+        dest="search_globally",
+        help="Ignore --paper-id and search the whole indexed corpus",
+    )
     return parser.parse_args()
+
+
+def _sub_queries(args: argparse.Namespace) -> list[RetrievalQuery] | None:
+    if not args.sub_questions:
+        return None
+    queries: list[RetrievalQuery] = []
+    for item in args.sub_questions:
+        dimension, _, text = str(item).partition("=")
+        if not text:
+            dimension, text = "", dimension
+        queries.append(
+            RetrievalQuery(
+                query=text.strip(),
+                mode=RetrievalMode(str(args.sub_mode)),
+                paper_ids=[] if args.search_globally else list(args.paper_ids),
+                dimension=dimension.strip() or None,
+            )
+        )
+    return queries
 
 
 async def _run() -> None:
     args = _arguments()
     settings = get_settings()
-    reranker = (
-        SentenceTransformerCrossEncoderReranker(
-            model_name=settings.reranker_model,
-            max_length=settings.reranker_max_length,
-            device=settings.reranker_device,
-        )
-        if settings.reranker_model
-        else None
-    )
-    retriever = TreeRagRetriever(
-        embedder=OpenAITextEmbeddingGateway(
-            model=settings.embedding_model,
-            api_key=settings.embedding_api_key,
-            base_url=settings.embedding_base_url,
-            dimensions=settings.embedding_dimensions,
-        ),
-        vector_store=ChromaTreeVectorStore(
-            persist_directory=settings.vector_db_path,
-            collection_name=settings.vector_collection,
-        ),
-        reranker=reranker,
-        initial_top_k=settings.retrieval_initial_top_k,
-        final_top_k=settings.retrieval_final_top_k,
-        max_expanded_per_hit=settings.retrieval_max_expanded_per_hit,
-        max_candidates=settings.retrieval_max_candidates,
-        max_chunks_per_paper=settings.retrieval_max_chunks_per_paper,
-        paper_top_k=settings.retrieval_paper_top_k,
-        sections_per_paper=settings.retrieval_sections_per_paper,
-        global_fallback_top_k=settings.retrieval_global_fallback_top_k,
-        min_ranking_score=settings.retrieval_min_ranking_score,
-        score_window=settings.retrieval_score_window,
-        mmr_top_k=settings.retrieval_mmr_top_k,
-        mmr_lambda=settings.retrieval_mmr_lambda,
-    )
+    retriever = build_retriever(settings)
+    strategy = None if args.strategy is None else RetrievalStrategy(str(args.strategy))
     report = await retriever.retrieve(
         args.query,
-        paper_ids=args.paper_ids,
-        mode=RetrievalMode(args.mode),
+        paper_ids=None if args.search_globally else list(args.paper_ids),
+        mode=RetrievalMode(str(args.mode)),
+        strategy=strategy,
+        queries=_sub_queries(args),
     )
     payload = report.model_dump_json(indent=2)
     sys.stdout.buffer.write(payload.encode("utf-8"))

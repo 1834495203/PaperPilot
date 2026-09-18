@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import Select, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.domain.entities import (
@@ -104,7 +104,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             await session.commit()
         return deleted_id is not None
 
-    async def list_messages(self, conversation_id: UUID) -> Sequence[Message]:
+    async def list_messages(
+        self,
+        conversation_id: UUID,
+        *,
+        include_superseded: bool = False,
+    ) -> Sequence[Message]:
         async with self._session_factory() as session:
             rows = (
                 await session.scalars(
@@ -113,7 +118,23 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .order_by(MessageRow.sequence.asc())
                 )
             ).all()
-        return [self._to_message(row) for row in rows]
+        messages = [self._to_message(row) for row in rows]
+        if include_superseded:
+            return messages
+        # Filtered in Python so the rule stays backend independent: a superseded
+        # message keeps its row and only leaves the default thread view.
+        return [message for message in messages if message.is_active]
+
+    async def get_message(
+        self,
+        conversation_id: UUID,
+        message_id: UUID,
+    ) -> Message | None:
+        async with self._session_factory() as session:
+            row = await session.get(MessageRow, str(message_id))
+        if row is None or str(row.conversation_id) != str(conversation_id):
+            return None
+        return self._to_message(row)
 
     async def list_events(
         self,
@@ -179,6 +200,34 @@ class SqlAlchemyConversationStore(ConversationStore):
             session.add(row)
             await session.commit()
         return self._to_run(row)
+
+    async def get_run(self, conversation_id: UUID, run_id: UUID) -> AgentRun | None:
+        async with self._session_factory() as session:
+            row = await session.get(AgentRunRow, str(run_id))
+        if row is None or str(row.conversation_id) != str(conversation_id):
+            return None
+        return self._to_run(row)
+
+    async def list_run_events(
+        self,
+        run_id: UUID,
+        *,
+        after_sequence: int = 0,
+    ) -> Sequence[AgentEvent]:
+        persisted_type_values = [event_type.value for event_type in PERSISTED_AGENT_EVENT_TYPES]
+        async with self._session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(AgentEventRow)
+                    .where(
+                        AgentEventRow.run_id == str(run_id),
+                        AgentEventRow.sequence > after_sequence,
+                        AgentEventRow.event_type.in_(persisted_type_values),
+                    )
+                    .order_by(AgentEventRow.sequence.asc())
+                )
+            ).all()
+        return [self._to_event(row) for row in rows]
 
     async def list_runs(self, conversation_id: UUID) -> Sequence[AgentRun]:
         async with self._session_factory() as session:
@@ -322,15 +371,66 @@ class SqlAlchemyConversationStore(ConversationStore):
             session.add(row)
             await session.commit()
 
-    async def delete_messages_from(self, conversation_id: UUID, sequence: int) -> None:
+    async def supersede_messages_from(
+        self,
+        conversation_id: UUID,
+        sequence: int,
+        *,
+        superseded_by_run: UUID,
+        before_sequence: int | None = None,
+    ) -> int:
+        return await self._supersede(
+            select(MessageRow).where(
+                MessageRow.conversation_id == str(conversation_id),
+                MessageRow.sequence >= sequence,
+                *(
+                    (MessageRow.sequence < before_sequence,)
+                    if before_sequence is not None
+                    else ()
+                ),
+            ),
+            superseded_by_run=superseded_by_run,
+        )
+
+    async def supersede_run_messages(
+        self,
+        conversation_id: UUID,
+        run_id: UUID,
+        *,
+        superseded_by_run: UUID,
+    ) -> int:
+        # Messages carry their run inside metadata rather than in a column, so the
+        # conversation is selected first and the run is matched in Python.
+        return await self._supersede(
+            select(MessageRow).where(
+                MessageRow.conversation_id == str(conversation_id)
+            ),
+            superseded_by_run=superseded_by_run,
+            match_run_id=str(run_id),
+        )
+
+    async def _supersede(
+        self,
+        statement: Select[tuple[MessageRow]],
+        *,
+        superseded_by_run: UUID,
+        match_run_id: str | None = None,
+    ) -> int:
         async with self._session_factory() as session:
-            await session.execute(
-                delete(MessageRow).where(
-                    MessageRow.conversation_id == str(conversation_id),
-                    MessageRow.sequence >= sequence,
-                )
-            )
-            await session.commit()
+            rows = (await session.scalars(statement)).all()
+            updated = 0
+            for row in rows:
+                metadata = dict(cast(dict[str, object], row.message_metadata or {}))
+                if "superseded_by_run" in metadata:
+                    continue
+                if match_run_id is not None and metadata.get("run_id") != match_run_id:
+                    continue
+                metadata["superseded_by_run"] = str(superseded_by_run)
+                row.message_metadata = metadata
+                updated += 1
+            if updated:
+                await session.commit()
+        return updated
 
     async def delete_run(self, run_id: UUID) -> None:
         run_key = str(run_id)

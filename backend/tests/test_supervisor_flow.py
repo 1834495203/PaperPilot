@@ -180,6 +180,7 @@ async def test_supervisor_routes_search_result_back_to_writer() -> None:
     initial_state = SupervisorState(
         user_request="Find a paper about RAG hallucination evaluation",
         conversation_context="user: Find a paper about RAG hallucination evaluation",
+        research_plan=None,
         artifacts=[],
         completed_steps=[],
         decision=None,
@@ -229,6 +230,7 @@ def test_supervisor_keeps_model_decision_separate_from_policy_override() -> None
     state = SupervisorState(
         user_request="Is this idea novel?",
         conversation_context="user: Is this idea novel?",
+        research_plan=None,
         artifacts=[],
         completed_steps=[],
         decision=None,

@@ -1,0 +1,143 @@
+{
+  "name": "paperpilot-retrieval-sample",
+  "collection": "paperpilot_tree_chunks",
+  "cases": [
+    {
+      "case_id": "single-paper-fact",
+      "question": "How does the retriever build its hierarchical index?",
+      "mode": "method",
+      "paper_ids": [
+        "treerag"
+      ],
+      "expected_strategy": "single_paper",
+      "expected_paper_ids": [
+        "treerag"
+      ],
+      "expected_dimensions": [],
+      "expected_evidence": [
+        {
+          "paper_id": "treerag",
+          "anchor": "ancestor"
+        }
+      ],
+      "notes": "Replace paper_ids and anchors with ids and verbatim text from your own corpus."
+    },
+    {
+      "case_id": "multi-paper-comparison",
+      "question": "Compare the retrieval method, experimental results and limitations of the indexed papers.",
+      "mode": "compare",
+      "paper_ids": [
+        "paper-a",
+        "paper-b",
+        "paper-c"
+      ],
+      "expected_strategy": "multi_paper",
+      "expected_paper_ids": [
+        "paper-a",
+        "paper-b",
+        "paper-c"
+      ],
+      "expected_dimensions": [
+        "method",
+        "results",
+        "limitations"
+      ],
+      "sub_questions": [
+        {
+          "query": "retrieval method and index construction",
+          "dimension": "method",
+          "paper_ids": [
+            "paper-a"
+          ]
+        },
+        {
+          "query": "retrieval method and index construction",
+          "dimension": "method",
+          "paper_ids": [
+            "paper-b"
+          ]
+        },
+        {
+          "query": "experimental setup datasets metrics evaluation results",
+          "dimension": "results",
+          "paper_ids": [
+            "paper-a"
+          ]
+        },
+        {
+          "query": "experimental setup datasets metrics evaluation results",
+          "dimension": "results",
+          "paper_ids": [
+            "paper-b"
+          ]
+        },
+        {
+          "query": "limitations future work failure cases",
+          "dimension": "limitations",
+          "paper_ids": [
+            "paper-a"
+          ]
+        },
+        {
+          "query": "limitations future work failure cases",
+          "dimension": "limitations",
+          "paper_ids": [
+            "paper-b"
+          ]
+        }
+      ],
+      "expected_evidence": [
+        {
+          "paper_id": "paper-a",
+          "anchor": "dataset",
+          "dimension": "results"
+        },
+        {
+          "paper_id": "paper-b",
+          "anchor": "dataset",
+          "dimension": "results"
+        },
+        {
+          "paper_id": "paper-a",
+          "anchor": "limitation",
+          "dimension": "limitations"
+        }
+      ],
+      "notes": "One sub-question per paper x dimension is what the Reader plan produces for a comparison."
+    },
+    {
+      "case_id": "corpus-survey",
+      "question": "Which indexed papers evaluate on the same benchmark family?",
+      "mode": "synthesis",
+      "expected_strategy": "corpus_survey",
+      "expected_paper_ids": [
+        "paper-a",
+        "paper-b"
+      ],
+      "expected_dimensions": [
+        "results"
+      ],
+      "sub_questions": [
+        {
+          "query": "benchmark dataset evaluation results comparison",
+          "dimension": "results"
+        },
+        {
+          "query": "reported metrics and benchmark tables",
+          "dimension": "results"
+        }
+      ],
+      "expected_evidence": [],
+      "notes": "Similarity retrieval returns candidates; completeness still needs a structured field check."
+    },
+    {
+      "case_id": "unanswerable-topic",
+      "question": "Which indexed paper reports a negative transfer result?",
+      "mode": "fact",
+      "expects_answer": false,
+      "expected_paper_ids": [],
+      "expected_evidence": [],
+      "notes": "An unanswerable question. It feeds false_recall / false_candidate instead of recall, and shows whether the library lets retrieval confirm an answer that does not exist."
+    }
+  ]
+}

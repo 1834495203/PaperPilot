@@ -1,5 +1,6 @@
 import math
 from collections.abc import Sequence
+from typing import Any
 
 from langchain_openai import OpenAIEmbeddings
 from pydantic import SecretStr
@@ -20,14 +21,17 @@ class OpenAITextEmbeddingGateway(TextEmbeddingGateway):
     ) -> None:
         if not api_key.get_secret_value():
             raise ValueError("EMBEDDING_API_KEY is required for paper ingestion")
-        self._client = OpenAIEmbeddings(
-            model=model,
-            openai_api_key=api_key,
-            openai_api_base=base_url,
-            dimensions=dimensions,
-            tiktoken_enabled=False,
-            check_embedding_ctx_length=False,
-        )
+        # langchain-openai exposes these as pydantic aliases, so mypy can only
+        # check the keyword spellings when the pydantic plugin is loaded.
+        options: dict[str, Any] = {
+            "model": model,
+            "openai_api_key": api_key,
+            "openai_api_base": base_url,
+            "dimensions": dimensions,
+            "tiktoken_enabled": False,
+            "check_embedding_ctx_length": False,
+        }
+        self._client = OpenAIEmbeddings(**options)
 
     async def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:

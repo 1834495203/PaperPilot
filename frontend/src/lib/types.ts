@@ -18,6 +18,9 @@ export interface Message {
   sequence: number;
   created_at: string;
   metadata: Record<string, JsonValue>;
+  /** Run that replaced this message, or null while it is the live version. */
+  superseded_by_run: string | null;
+  is_active: boolean;
 }
 
 export interface CitationSpan {
@@ -46,9 +49,31 @@ export type AgentEventType =
   | "tool.completed"
   | "tool.failed"
   | "metrics.updated"
+  | "run.resumed"
   | "run.completed"
   | "run.failed"
   | "run.cancelled";
+
+export type CitationIssueKind = "unknown_evidence_id" | "unsupported_claim";
+
+export interface CitationIssue {
+  evidence_id: string;
+  kind: CitationIssueKind;
+  detail: string;
+}
+
+/**
+ * Result of checking whether an answer's citations support its claims. Unknown
+ * IDs mean the marker could not be resolved; issues mean the cited evidence does
+ * not state what the sentence claims.
+ */
+export interface CitationVerification {
+  checked: number;
+  supported: string[];
+  issues: CitationIssue[];
+  verification_error: string | null;
+  has_problems: boolean;
+}
 
 export interface AgentEvent {
   id: string;

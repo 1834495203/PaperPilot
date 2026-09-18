@@ -15,6 +15,7 @@ frontend/node_modules/
 frontend/.next/
 frontend/out/
 *.tsbuildinfo
+paperpilot-backup-*.tar.gz
 
 # Agent tooling local state.
 .zcode/
@@ -25,4 +26,5 @@ frontend/out/
 
 # Personal documents must stay local.
 /*简历*.docx
+/*简历*.pdf
 /~$*.docx

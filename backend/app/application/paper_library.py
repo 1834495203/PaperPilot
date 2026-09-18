@@ -13,6 +13,8 @@ from app.domain.ports import ScientificPaperParser, TreeVectorStore
 from app.domain.rag import (
     IndexedPaper,
     IndexedPaperDetail,
+    IndexSignature,
+    PaperIndexStatus,
     PaperTreeNodeView,
     RetrievalMode,
     TreeRetrievalReport,
@@ -39,6 +41,7 @@ class PaperLibraryService:
         retriever: TreeRagRetriever,
         vector_store: TreeVectorStore | None = None,
         metadata_parser: ScientificPaperParser | None = None,
+        index_signature: IndexSignature | None = None,
     ) -> None:
         self._library_path = library_path.resolve()
         self._max_upload_bytes = max_upload_bytes
@@ -46,11 +49,19 @@ class PaperLibraryService:
         self._retriever = retriever
         self._vector_store = vector_store
         self._metadata_parser = metadata_parser
+        self._index_signature = index_signature
         self._lock = asyncio.Lock()
 
     @property
     def max_upload_bytes(self) -> int:
         return self._max_upload_bytes
+
+    @property
+    def index_signature(self) -> IndexSignature | None:
+        return self._index_signature
+
+    def _signature_fingerprint(self) -> str | None:
+        return None if self._index_signature is None else self._index_signature.fingerprint
 
     async def initialize(self) -> None:
         await asyncio.to_thread(self._library_path.mkdir, parents=True, exist_ok=True)
@@ -93,6 +104,7 @@ class PaperLibraryService:
                 section_count=result.section_count,
                 node_count=result.node_count,
                 chunk_count=result.chunk_count,
+                index_signature=self._signature_fingerprint(),
             )
             await asyncio.to_thread(
                 manifest_path.write_text,
@@ -103,6 +115,21 @@ class PaperLibraryService:
 
     async def list_papers(self) -> list[IndexedPaper]:
         return await asyncio.to_thread(self._list_papers_sync)
+
+    async def index_status(self) -> list[PaperIndexStatus]:
+        """Report which indexed papers still match the current index fingerprint."""
+
+        current = self._signature_fingerprint()
+        return [
+            PaperIndexStatus(
+                paper_id=paper.paper_id,
+                title=paper.title,
+                chunk_count=paper.chunk_count,
+                index_signature=paper.index_signature,
+                current_signature=current,
+            )
+            for paper in await self.list_papers()
+        ]
 
     async def get_paper(self, paper_id: str) -> IndexedPaper:
         if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", paper_id) is None:

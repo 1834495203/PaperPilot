@@ -53,3 +53,6 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Keep the pytest temp root inside the repository (gitignored) so the documented
+# command works on hosts where the system temp directory is not writable.
+addopts = "--basetemp=.pytest-tmp"

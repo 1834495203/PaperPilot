@@ -184,8 +184,12 @@ function eventLabel(event: AgentEvent): string {
       if (readString(event.payload, "actor") === "reader") {
         if (readString(event.payload, "stage") === "reader.plan") return "Reader 制定检索计划";
         if (readString(event.payload, "stage") === "reader.assess") return "Reader 评估证据覆盖";
+        if (readString(event.payload, "stage") === "reader.retrieve_gaps") {
+          return "Reader 针对覆盖缺口补检";
+        }
         return "Reader 形成阅读结论";
       }
+      if (readString(event.payload, "actor") === "planner") return "Planner 制定任务计划";
       if (readString(event.payload, "actor") === "analyst") return "Analyst 形成分析结论";
       return "Agent 已记录决策";
     case "tool.started":
@@ -195,12 +199,18 @@ function eventLabel(event: AgentEvent): string {
         return `PDF 解析完成 · ${readNumber(event.payload, "extracted_pages") ?? 0} 页`;
       }
       if (readString(event.payload, "tool_name") === "retrieve_indexed_paper") {
+        const strategy = readString(event.payload, "retrieval_strategy");
+        const missing = readStringArray(event.payload, "missing_paper_ids");
         return [
+          strategy ? `策略 ${strategy}` : null,
           `向量召回 ${readNumber(event.payload, "initial_hit_count") ?? 0}`,
+          `关键词召回 ${readNumber(event.payload, "keyword_candidate_count") ?? 0}`,
           `树扩展 ${readNumber(event.payload, "expanded_candidate_count") ?? 0}`,
-          `MMR ${readNumber(event.payload, "mmr_candidate_count") ?? 0}`,
           `最终证据 ${readNumber(event.payload, "hit_count") ?? 0}`,
-        ].join(" · ");
+          missing.length > 0 ? `缺失论文 ${missing.join(",")}` : null,
+        ]
+          .filter((item): item is string => item !== null)
+          .join(" · ");
       }
       return `工具返回 ${readNumber(event.payload, "result_count") ?? 0} 篇论文`;
     case "tool.failed":
@@ -215,6 +225,8 @@ function eventLabel(event: AgentEvent): string {
       return `任务失败：${readString(event.payload, "error") ?? "未知错误"}`;
     case "run.cancelled":
       return readString(event.payload, "summary") ?? "任务已停止";
+    case "run.resumed":
+      return readString(event.payload, "summary") ?? "已重新连接任务";
     case "message.token":
       return "";
   }

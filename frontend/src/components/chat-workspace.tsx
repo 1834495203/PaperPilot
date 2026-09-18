@@ -27,6 +27,7 @@ import {
   listMessages,
   listIndexedPapers,
   regenerateMessage,
+  resumeRunStream,
   streamMessage,
   uploadPaper,
 } from "@/lib/api";
@@ -42,6 +43,13 @@ import type {
   Message,
   RunMetrics,
 } from "@/lib/types";
+
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAY_MS = 1_000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 const EMPTY_METRICS: RunMetrics = {
   inputTokens: 0,
@@ -81,6 +89,7 @@ export function ChatWorkspace() {
   const [metrics, setMetrics] = useState<RunMetrics>(EMPTY_METRICS);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
   const [papers, setPapers] = useState<IndexedPaper[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [deletingPaperId, setDeletingPaperId] = useState<string | null>(null);
@@ -90,6 +99,9 @@ export function ChatWorkspace() {
   const metricsBaseline = useRef<RunMetrics>(EMPTY_METRICS);
   const activeRunId = useRef<string | null>(null);
   const streamController = useRef<AbortController | null>(null);
+  const [previousVersions, setPreviousVersions] = useState<
+    Record<string, Message | null>
+  >({});
 
   useEffect(() => () => streamController.current?.abort(), []);
 
@@ -185,6 +197,13 @@ export function ChatWorkspace() {
 
   const handleEvent = useCallback((event: AgentEvent) => {
     setEvents((current) => [...current, event]);
+    if (event.type === "run.resumed") {
+      setConnectionNotice(
+        event.payload.gap === true
+          ? "连接恢复，但中断期间的 token 事件无法回放，最终回答以消息记录为准。"
+          : "已重新连接到正在执行的任务。",
+      );
+    }
     if (event.type === "run.started") {
       activeRunId.current = event.run_id;
       setMessages((current) => current.map((message) =>
@@ -243,6 +262,7 @@ export function ChatWorkspace() {
       event.type === "run.cancelled"
     ) {
       activeRunId.current = null;
+      setConnectionNotice(null);
       setRuns((current) => current.map((run) => run.id === event.run_id ? {
         ...run,
         status: event.type === "run.completed"
@@ -277,6 +297,87 @@ export function ChatWorkspace() {
     }
   }, []);
 
+  /**
+   * Run a stream to completion, re-attaching after a dropped connection.
+   *
+   * The server keeps executing the run when the browser goes away, so recovery is
+   * a resume from the last sequence seen rather than a restart. A fetch that ends
+   * without a terminal event is treated the same way, because that also means the
+   * client stopped receiving a run that may still be going.
+   */
+  const streamWithRecovery = useCallback(
+    async (
+      conversationId: string,
+      start: (
+        onEvent: (event: AgentEvent) => void,
+        signal: AbortSignal,
+      ) => Promise<void>,
+      controller: AbortController,
+    ) => {
+      let lastSequence = 0;
+      let sawTerminal = false;
+      const onEvent = (event: AgentEvent) => {
+        lastSequence = Math.max(lastSequence, event.sequence);
+        if (
+          event.type === "run.completed" ||
+          event.type === "run.failed" ||
+          event.type === "run.cancelled"
+        ) {
+          sawTerminal = true;
+        }
+        handleEvent(event);
+      };
+      for (let attempt = 0; attempt <= MAX_RECONNECT_ATTEMPTS; attempt += 1) {
+        try {
+          if (attempt === 0) {
+            await start(onEvent, controller.signal);
+          } else {
+            const runId = activeRunId.current;
+            if (runId === null) return;
+            await resumeRunStream(
+              conversationId,
+              runId,
+              lastSequence,
+              onEvent,
+              controller.signal,
+            );
+          }
+        } catch (caught) {
+          if (caught instanceof DOMException && caught.name === "AbortError") throw caught;
+          if (attempt === MAX_RECONNECT_ATTEMPTS) throw caught;
+          setConnectionNotice("连接中断，正在重新连接任务…");
+          await delay(RECONNECT_DELAY_MS * (attempt + 1));
+          continue;
+        }
+        if (sawTerminal) return;
+        if (attempt === MAX_RECONNECT_ATTEMPTS) return;
+        // The response ended while the run had not reported an outcome.
+        await delay(RECONNECT_DELAY_MS);
+      }
+    },
+    [handleEvent],
+  );
+
+  const loadPreviousVersion = useCallback(
+    async (conversationId: string, runId: string, supersededBy: string) => {
+      setPreviousVersions((current) => ({ ...current, [runId]: null }));
+      try {
+        const all = await listMessages(conversationId, true);
+        const previous = all
+          .filter(
+            (message) =>
+              message.superseded_by_run === supersededBy &&
+              message.role === "assistant",
+          )
+          .at(-1) ?? null;
+        setPreviousVersions((current) => ({ ...current, [runId]: previous }));
+      } catch {
+        setPreviousVersions((current) => ({ ...current, [runId]: null }));
+      }
+    },
+    [],
+  );
+
   const handleSubmit = async (submitEvent: FormEvent<HTMLFormElement>) => {
     submitEvent.preventDefault();
     const content = draft.trim();
@@ -284,6 +385,7 @@ export function ChatWorkspace() {
 
     setDraft("");
     setError(null);
+    setConnectionNotice(null);
     setStreamedAnswer("");
     metricsBaseline.current = metrics;
     setIsRunning(true);
@@ -300,14 +402,15 @@ export function ChatWorkspace() {
         sequence: current.length + 1,
         created_at: new Date().toISOString(),
         metadata: {},
+        superseded_by_run: null,
+        is_active: true,
       },
     ]);
     try {
-      await streamMessage(
+      await streamWithRecovery(
         activeId,
-        content,
-        handleEvent,
-        controller.signal,
+        (onEvent, signal) => streamMessage(activeId, content, onEvent, signal),
+        controller,
       );
       const [storedMessages, storedRuns, storedEvents] = await Promise.all([
         listMessages(activeId),
@@ -333,6 +436,7 @@ export function ChatWorkspace() {
   const handleRegenerate = async (messageId: string) => {
     if (activeId === null || isRunning) return;
     setError(null);
+    setConnectionNotice(null);
     setStreamedAnswer("");
     metricsBaseline.current = metrics;
     setIsRunning(true);
@@ -340,7 +444,12 @@ export function ChatWorkspace() {
     const controller = new AbortController();
     streamController.current = controller;
     try {
-      await regenerateMessage(activeId, messageId, handleEvent, controller.signal);
+      await streamWithRecovery(
+        activeId,
+        (onEvent, signal) =>
+          regenerateMessage(activeId, messageId, onEvent, signal),
+        controller,
+      );
       const [storedMessages, storedRuns, storedEvents] = await Promise.all([
         listMessages(activeId),
         listConversationRuns(activeId),
@@ -559,6 +668,19 @@ export function ChatWorkspace() {
               isLatest && messageId !== undefined
                 ? { onRegenerate: () => void handleRegenerate(messageId) }
                 : {};
+            const wasRegenerated =
+              task.userMessage?.metadata.regenerates_message_id !== undefined;
+            const versionProps = wasRegenerated
+              ? {
+                  previousVersion: previousVersions[task.run.id],
+                  onLoadPreviousVersion: () =>
+                    void loadPreviousVersion(
+                      task.run.conversation_id,
+                      task.run.id,
+                      task.run.id,
+                    ),
+                }
+              : {};
             return (
               <TurnTask
                 assistantMessage={task.assistantMessage}
@@ -568,6 +690,7 @@ export function ChatWorkspace() {
                 regenerateDisabled={isRunning}
                 run={task.run}
                 userMessage={task.userMessage}
+                {...versionProps}
                 {...regenerateProps}
               />
             );
@@ -576,6 +699,9 @@ export function ChatWorkspace() {
             <article className="bubble assistant streaming">
               <span>PAPERPILOT · STREAMING</span><p>{streamedAnswer}</p>
             </article>
+          ) : null}
+          {connectionNotice ? (
+            <div className="connection-notice" role="status">{connectionNotice}</div>
           ) : null}
           {error ? <div className="error">{error}</div> : null}
         </div>

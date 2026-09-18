@@ -26,6 +26,7 @@ class AgentExecutionRecorder:
         output_tokens: int,
         total_tokens: int,
         citations: list[dict[str, JsonValue]] | None = None,
+        citation_verification: JsonValue | None = None,
     ) -> UUID:
         metadata: dict[str, JsonValue] = {
             "run_id": str(context.run_id),
@@ -39,6 +40,8 @@ class AgentExecutionRecorder:
         }
         if citations:
             metadata["citations"] = cast(JsonValue, citations)
+        if citation_verification is not None:
+            metadata["citation_verification"] = citation_verification
         stored = await self._store.append_message(
             context.conversation_id,
             MessageRole.ASSISTANT,

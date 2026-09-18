@@ -2,6 +2,8 @@ import type {
   AgentEvent,
   AgentRun,
   Citation,
+  CitationIssue,
+  CitationVerification,
   Conversation,
   ConversationMetricsResponse,
   JsonValue,
@@ -52,10 +54,15 @@ export async function deleteConversation(conversationId: string): Promise<void> 
   }
 }
 
-export function listMessages(conversationId: string): Promise<Message[]> {
-  return requestJson<Message[]>(`/conversations/${conversationId}/messages`, {
-    cache: "no-store",
-  });
+export function listMessages(
+  conversationId: string,
+  includeSuperseded = false,
+): Promise<Message[]> {
+  const suffix = includeSuperseded ? "?include_superseded=true" : "";
+  return requestJson<Message[]>(
+    `/conversations/${conversationId}/messages${suffix}`,
+    { cache: "no-store" },
+  );
 }
 
 export function listIndexedPapers(): Promise<IndexedPaper[]> {
@@ -95,6 +102,45 @@ export function readCitations(message: Message): Citation[] {
   const raw = message.metadata?.citations;
   if (!Array.isArray(raw)) return [];
   return raw.map(toCitation).filter((item): item is Citation => item !== null);
+}
+
+/**
+ * Read the citation-support verdict of an answer.
+ *
+ * Older answers predate verification, so a missing record means "not checked"
+ * rather than "clean".
+ */
+export function readCitationVerification(message: Message): CitationVerification | null {
+  const raw = message.metadata?.citation_verification;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const record = raw as Record<string, JsonValue>;
+  const issues: CitationIssue[] = [];
+  const rawIssues = record.issues;
+  if (Array.isArray(rawIssues)) {
+    for (const item of rawIssues) {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+      const entry = item as Record<string, JsonValue>;
+      const evidenceId = entry.evidence_id;
+      const kind = entry.kind;
+      const detail = entry.detail;
+      if (typeof evidenceId !== "string" || typeof detail !== "string") continue;
+      if (kind !== "unknown_evidence_id" && kind !== "unsupported_claim") continue;
+      issues.push({ evidence_id: evidenceId, kind, detail });
+    }
+  }
+  const supported = Array.isArray(record.supported)
+    ? record.supported.filter((item): item is string => typeof item === "string")
+    : [];
+  const verificationError = record.verification_error;
+  return {
+    checked: typeof record.checked === "number" ? record.checked : 0,
+    supported,
+    issues,
+    verification_error: typeof verificationError === "string" ? verificationError : null,
+    has_problems:
+      issues.length > 0 ||
+      (typeof verificationError === "string" && verificationError.length > 0),
+  };
 }
 
 export function uploadPaper(file: File): Promise<IndexedPaper> {
@@ -195,6 +241,25 @@ export async function streamMessage(
       headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
       body: JSON.stringify({ content }),
     },
+    onEvent,
+    signal,
+  );
+}
+
+/**
+ * Re-attach to a run after a dropped connection, replaying events after the last
+ * sequence the client saw. The run itself keeps executing on the server.
+ */
+export async function resumeRunStream(
+  conversationId: string,
+  runId: string,
+  after: number,
+  onEvent: (event: AgentEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  await streamEvents(
+    `/conversations/${conversationId}/runs/${runId}/stream?after=${after}`,
+    { method: "GET", headers: { Accept: "text/event-stream" } },
     onEvent,
     signal,
   );

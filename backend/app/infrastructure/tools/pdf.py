@@ -3,6 +3,7 @@ from io import BytesIO
 from urllib.parse import urlparse
 
 import httpx
+from pydantic import HttpUrl
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
@@ -115,7 +116,7 @@ class ArxivPdfDocumentGateway(PaperDocumentGateway):
                 "PDF contains no extractable text; scanned-image OCR is not supported"
             )
         return PdfDocument(
-            source_url=source_url,
+            source_url=HttpUrl(source_url),
             page_count=page_count,
             extracted_pages=extracted_pages,
             extracted_characters=len(text),

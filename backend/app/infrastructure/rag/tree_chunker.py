@@ -83,6 +83,8 @@ class _TextUnit:
 class TreeRagChunker:
     """Create TreeRAG-style nodes with ancestor-title-prefixed embedding text."""
 
+    VERSION = "tree-rag-4"
+
     def __init__(
         self,
         *,
@@ -288,10 +290,12 @@ class TreeRagChunker:
         drop: set[int] = set()
         for caption_index in caption_indices:
             caption_unit = units[caption_index]
-            key = (caption_unit.target_type, caption_unit.object_label)
-            target = object_index.get(key) if (
-                caption_unit.object_label is not None and caption_unit.target_type is not None
-            ) else None
+            target = (
+                object_index.get((caption_unit.target_type, caption_unit.object_label))
+                if caption_unit.object_label is not None
+                and caption_unit.target_type is not None
+                else None
+            )
             if target is None:
                 continue
             units[target] = self._attach_caption(units[target], caption_unit)

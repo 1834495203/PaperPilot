@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import cast
+from uuid import UUID
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.runtime import Runtime
@@ -40,6 +41,16 @@ class PolicyAdjustment:
 class DecisionResolution:
     decision: SupervisorDecision
     adjustments: list[PolicyAdjustment]
+
+
+@dataclass(frozen=True, slots=True)
+class ReaderScopeResolution:
+    """Resolved reader scope; ``task is None`` means the workflow must search first."""
+
+    task: ReaderTask | None
+    adjustments: list[PolicyAdjustment]
+    recovery_rule: str | None = None
+    recovery_original: str = ""
 
 
 class SupervisorNode:
@@ -88,13 +99,17 @@ class SupervisorNode:
             return self._state_update(state, decision, None)
 
         completed = [step.model_dump(mode="json") for step in state["completed_steps"]]
+        research_plan = state["research_plan"]
         prompt = (
             f"User request:\n{state['user_request']}\n\n"
             f"Conversation context:\n{state['conversation_context']}\n\n"
             f"Local indexed corpus available:\n{context.local_corpus_available}\n\n"
             f"Explicitly scoped local paper IDs (normally empty):\n"
             f"{list(context.paper_ids)}\n\n"
-            f"Completed steps:\n{completed}\n\n"
+            f"Research plan (authoritative task strategy unless completed steps "
+            f"contradict it):\n"
+            f"{research_plan.model_dump_json() if research_plan is not None else 'not planned'}"
+            f"\n\nCompleted steps:\n{completed}\n\n"
             "Agent-authored supervisor summaries (detailed reports are available to downstream "
             f"agents by ID):\n{render_supervisor_context(state['artifacts'])}"
         )
@@ -209,38 +224,25 @@ class SupervisorNode:
                 )
                 task = task.model_copy(update={"prior_search_artifact_ids": valid_prior_ids})
         elif isinstance(task, ReaderTask):
-            if task.paper_id is None and (local_corpus_available or available_local_ids):
-                if task.source_artifact_id is not None:
-                    adjustments.append(
-                        PolicyAdjustment(
-                            rule="global_local_reader_does_not_require_search_source",
-                            summary="全库检索不需要 Search Artifact，已移除该引用",
-                            original_value=str(task.source_artifact_id),
-                            effective_value=None,
-                        )
-                    )
-                    task = task.model_copy(update={"source_artifact_id": None})
-            elif task.paper_id in available_local_ids:
-                if task.source_artifact_id is not None:
-                    adjustments.append(
-                        PolicyAdjustment(
-                            rule="local_reader_does_not_require_search_source",
-                            summary="本地已建库论文不需要 Search Artifact，已移除该引用",
-                            original_value=str(task.source_artifact_id),
-                            effective_value=None,
-                        )
-                    )
-                    task = task.model_copy(update={"source_artifact_id": None})
-            elif task.source_artifact_id not in valid_search_ids:
+            scope = SupervisorNode._normalize_reader_scope(
+                task,
+                available_local_ids=available_local_ids,
+                local_corpus_available=local_corpus_available,
+                valid_search_ids=valid_search_ids,
+            )
+            adjustments.extend(scope.adjustments)
+            if scope.task is None:
                 adjustments.append(
                     PolicyAdjustment(
-                        rule="reader_requires_search_source",
+                        rule=scope.recovery_rule or "reader_requires_search_source",
                         summary="Reader 必须引用有效的 Search Artifact，工作流改为补充检索",
-                        original_value=str(task.source_artifact_id),
+                        original_value=scope.recovery_original,
                         effective_value=AgentName.SEARCH.value,
                     )
                 )
                 task = SupervisorNode._recovery_search_task(state)
+            else:
+                task = scope.task
         elif isinstance(task, (AnalystTask, WriterTask)):
             valid_source_ids = [
                 artifact_id for artifact_id in task.source_artifact_ids if artifact_id in valid_ids
@@ -268,6 +270,118 @@ class SupervisorNode:
 
         decision = decision.model_copy(update={"assessment": assessment, "task": task})
         return DecisionResolution(decision=decision, adjustments=adjustments)
+
+    @staticmethod
+    def _normalize_reader_scope(
+        task: ReaderTask,
+        *,
+        available_local_ids: set[str],
+        local_corpus_available: bool,
+        valid_search_ids: set[UUID],
+    ) -> ReaderScopeResolution:
+        """Resolve single and multi-paper reader scope against what actually exists.
+
+        A multi-paper objective is the normal shape for a comparison, so the policy
+        keeps every locally indexed target instead of collapsing it to one paper,
+        and only falls back to a search when no requested paper is readable at all.
+        """
+
+        adjustments: list[PolicyAdjustment] = []
+        targets = task.target_paper_ids
+        if not targets:
+            if local_corpus_available or available_local_ids:
+                if task.source_artifact_id is not None:
+                    adjustments.append(
+                        PolicyAdjustment(
+                            rule="global_local_reader_does_not_require_search_source",
+                            summary="全库检索不需要 Search Artifact，已移除该引用",
+                            original_value=str(task.source_artifact_id),
+                            effective_value=None,
+                        )
+                    )
+                    return ReaderScopeResolution(
+                        task=task.model_copy(update={"source_artifact_id": None}),
+                        adjustments=adjustments,
+                    )
+                return ReaderScopeResolution(task=task, adjustments=adjustments)
+            if task.source_artifact_id in valid_search_ids:
+                return ReaderScopeResolution(task=task, adjustments=adjustments)
+            return ReaderScopeResolution(
+                task=None,
+                adjustments=adjustments,
+                recovery_original=str(task.source_artifact_id),
+            )
+
+        local_targets = [
+            paper_id for paper_id in targets if paper_id in available_local_ids
+        ]
+        if local_targets:
+            dropped = [paper_id for paper_id in targets if paper_id not in local_targets]
+            if not dropped and len(local_targets) == 1 and task.paper_id is not None:
+                if task.source_artifact_id is None:
+                    return ReaderScopeResolution(task=task, adjustments=adjustments)
+                adjustments.append(
+                    PolicyAdjustment(
+                        rule="local_reader_does_not_require_search_source",
+                        summary="本地已建库论文不需要 Search Artifact，已移除该引用",
+                        original_value=str(task.source_artifact_id),
+                        effective_value=None,
+                    )
+                )
+                return ReaderScopeResolution(
+                    task=task.model_copy(update={"source_artifact_id": None}),
+                    adjustments=adjustments,
+                )
+            updates: dict[str, object] = {
+                "paper_ids": local_targets,
+                "paper_id": None,
+                "source_artifact_id": None,
+            }
+            if dropped:
+                adjustments.append(
+                    PolicyAdjustment(
+                        rule="reader_local_targets_only",
+                        summary="只保留本地已建库论文；外部论文需要单独的 Search Artifact",
+                        original_value=[*targets],
+                        effective_value=[*local_targets],
+                    )
+                )
+            elif task.source_artifact_id is not None:
+                adjustments.append(
+                    PolicyAdjustment(
+                        rule="local_reader_does_not_require_search_source",
+                        summary="本地已建库论文不需要 Search Artifact，已移除该引用",
+                        original_value=str(task.source_artifact_id),
+                        effective_value=None,
+                    )
+                )
+            return ReaderScopeResolution(
+                task=task.model_copy(update=updates),
+                adjustments=adjustments,
+            )
+
+        if task.source_artifact_id not in valid_search_ids:
+            return ReaderScopeResolution(
+                task=None,
+                adjustments=adjustments,
+                recovery_original=",".join(targets),
+            )
+        if len(targets) == 1:
+            return ReaderScopeResolution(task=task, adjustments=adjustments)
+        adjustments.append(
+            PolicyAdjustment(
+                rule="external_reader_single_paper_only",
+                summary="外部 PDF 阅读一次只支持一篇论文，已限定为第一篇",
+                original_value=[*targets],
+                effective_value=targets[0],
+            )
+        )
+        return ReaderScopeResolution(
+            task=task.model_copy(
+                update={"paper_id": targets[0], "paper_ids": []}
+            ),
+            adjustments=adjustments,
+        )
 
     @staticmethod
     def _recovery_search_task(state: SupervisorState) -> SearchTask:
@@ -300,9 +414,11 @@ class SupervisorNode:
                     if task.source_artifact_id is not None
                     else []
                 ),
-                "paper_ids": [] if task.paper_id is None else [task.paper_id],
+                "paper_ids": cast(JsonValue, task.target_paper_ids),
                 "retrieval_scope": (
-                    "all_local_papers" if task.paper_id is None else "single_paper"
+                    "all_local_papers"
+                    if not task.target_paper_ids
+                    else "explicit_papers"
                 ),
                 "reader_depth": task.depth.value,
             }
