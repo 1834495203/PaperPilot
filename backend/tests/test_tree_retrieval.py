@@ -2,14 +2,18 @@ from collections.abc import Sequence
 
 import pytest
 
-from app.application.tree_retrieval import TreeRagRetriever, _Candidate
+from app.application.tree_retrieval import TreeRagRetriever, _Candidate, _Recall
 from app.domain.ports import TextEmbeddingGateway, TextRerankerGateway, TreeVectorStore
 from app.domain.rag import (
     IndexedTreeNode,
+    KeywordSearchResult,
     ParsedPaperDocument,
     RetrievalMode,
+    RetrievalQuery,
     RetrievalSource,
+    RetrievalStrategy,
     TreeIndexNode,
+    TreeKeywordMatch,
     TreeNodeType,
     TreeVectorMatch,
 )
@@ -94,11 +98,25 @@ class _Store(TreeVectorStore):
             tuple[Sequence[str] | None, bool, Sequence[TreeNodeType] | None, Sequence[str] | None]
         ] = []
         self.loaded_paper_ids: list[str] = []
+        self.loaded_node_ids: list[str] = []
+        self.loaded_parent_ids: list[str] = []
+        self.keyword_queries: list[list[str]] = []
         self.load_count = 0
 
     @property
     def collection_name(self) -> str:
         return "test_tree"
+
+    def _nodes(self) -> list[TreeIndexNode]:
+        return [self.root, self.method, self.chunk_a, self.chunk_b]
+
+    def _embeddings(self) -> dict[str, list[float]]:
+        return {
+            "root": [0.1, 0.9],
+            "method": [0.8, 0.2],
+            "chunk-a": [1.0, 0.0],
+            "chunk-b": [0.9, 0.1],
+        }
 
     async def replace_paper(
         self,
@@ -128,6 +146,19 @@ class _Store(TreeVectorStore):
             return [TreeVectorMatch(node=self.method, vector_score=0.8)]
         return [TreeVectorMatch(node=self.chunk_a, vector_score=1.0)]
 
+    async def keyword_search(
+        self,
+        terms: Sequence[str],
+        *,
+        paper_ids: Sequence[str] | None,
+        top_k: int,
+        chunks_only: bool = True,
+        node_types: Sequence[TreeNodeType] | None = None,
+        parent_ids: Sequence[str] | None = None,
+    ) -> KeywordSearchResult:
+        self.keyword_queries.append(list(terms))
+        return KeywordSearchResult()
+
     async def load_paper_nodes(
         self,
         paper_ids: Sequence[str],
@@ -135,10 +166,46 @@ class _Store(TreeVectorStore):
         self.load_count += 1
         self.loaded_paper_ids = list(paper_ids)
         return [
-            IndexedTreeNode(node=self.root, embedding=[0.1, 0.9]),
-            IndexedTreeNode(node=self.method, embedding=[0.8, 0.2]),
-            IndexedTreeNode(node=self.chunk_a, embedding=[1.0, 0.0]),
-            IndexedTreeNode(node=self.chunk_b, embedding=[0.9, 0.1]),
+            IndexedTreeNode(node=node, embedding=self._embeddings()[node.node_id])
+            for node in self._nodes()
+        ]
+
+    async def load_nodes(
+        self,
+        *,
+        paper_ids: Sequence[str] | None = None,
+        node_ids: Sequence[str] | None = None,
+        parent_ids: Sequence[str] | None = None,
+        node_types: Sequence[TreeNodeType] | None = None,
+    ) -> list[IndexedTreeNode]:
+        self.load_count += 1
+        if paper_ids:
+            self.loaded_paper_ids = list(paper_ids)
+        if node_ids:
+            self.loaded_node_ids = list(node_ids)
+        if parent_ids:
+            self.loaded_parent_ids = list(parent_ids)
+        wanted_ids = set(node_ids or ())
+        wanted_parents = set(parent_ids or ())
+        wanted_papers = set(paper_ids or ())
+        selected = [
+            node
+            for node in self._nodes()
+            if (wanted_ids and node.node_id in wanted_ids)
+            or (
+                wanted_parents
+                and (node.parent_id or "") in wanted_parents
+                and (node_types is None or node.node_type in node_types)
+            )
+            or (
+                wanted_papers
+                and node.paper_id in wanted_papers
+                and (node_types is None or node.node_type in node_types)
+            )
+        ]
+        return [
+            IndexedTreeNode(node=node, embedding=self._embeddings()[node.node_id])
+            for node in selected
         ]
 
 
@@ -174,7 +241,8 @@ async def test_method_mode_expands_a_leaf_to_related_sibling_chunks() -> None:
         mode=RetrievalMode.METHOD,
     )
 
-    assert store.load_count == 1
+    assert store.load_count == 2
+    assert store.loaded_parent_ids == ["method"]
     assert [hit.node_id for hit in report.hits] == ["chunk-a", "chunk-b"]
     sibling = report.hits[1]
     assert sibling.source is RetrievalSource.TREE_EXPANSION
@@ -297,7 +365,9 @@ async def test_global_retrieval_expands_only_papers_found_by_initial_recall() ->
     )
 
     assert store.searches[0][0] is None
-    assert store.loaded_paper_ids == ["paper"]
+    assert store.loaded_paper_ids == []
+    assert store.loaded_node_ids == ["chunk-a", "chunk-b", "method", "root"]
+    assert store.loaded_parent_ids == ["method"]
     assert report.searched_globally is True
     assert report.paper_ids == []
     assert report.candidate_paper_ids == ["paper"]
@@ -379,6 +449,18 @@ class _ParentAwareStore(TreeVectorStore):
             return [TreeVectorMatch(node=self.good_chunk, vector_score=0.78)]
         return [TreeVectorMatch(node=self.bad_chunk, vector_score=0.98)]
 
+    async def keyword_search(
+        self,
+        terms: Sequence[str],
+        *,
+        paper_ids: Sequence[str] | None,
+        top_k: int,
+        chunks_only: bool = True,
+        node_types: Sequence[TreeNodeType] | None = None,
+        parent_ids: Sequence[str] | None = None,
+    ) -> KeywordSearchResult:
+        return KeywordSearchResult()
+
     async def load_paper_nodes(
         self,
         paper_ids: Sequence[str],
@@ -390,6 +472,49 @@ class _ParentAwareStore(TreeVectorStore):
             IndexedTreeNode(node=self.bad_root, embedding=[0.0, 1.0]),
             IndexedTreeNode(node=self.bad_section, embedding=[0.0, 1.0]),
             IndexedTreeNode(node=self.bad_chunk, embedding=[0.98, 0.02]),
+        ]
+
+    async def load_nodes(
+        self,
+        *,
+        paper_ids: Sequence[str] | None = None,
+        node_ids: Sequence[str] | None = None,
+        parent_ids: Sequence[str] | None = None,
+        node_types: Sequence[TreeNodeType] | None = None,
+    ) -> list[IndexedTreeNode]:
+        embeddings = {
+            "good-root": [0.9, 0.1],
+            "good-section": [0.95, 0.05],
+            "good-chunk": [0.78, 0.22],
+            "bad-root": [0.0, 1.0],
+            "bad-section": [0.0, 1.0],
+            "bad-chunk": [0.98, 0.02],
+        }
+        nodes = [
+            self.good_root,
+            self.good_section,
+            self.good_chunk,
+            self.bad_root,
+            self.bad_section,
+            self.bad_chunk,
+        ]
+        wanted_ids = set(node_ids or ())
+        wanted_parents = set(parent_ids or ())
+        wanted_papers = set(paper_ids or ())
+        selected = [
+            node
+            for node in nodes
+            if (wanted_ids and node.node_id in wanted_ids)
+            or (wanted_parents and (node.parent_id or "") in wanted_parents)
+            or (
+                wanted_papers
+                and node.paper_id in wanted_papers
+                and (node_types is None or node.node_type in node_types)
+            )
+        ]
+        return [
+            IndexedTreeNode(node=node, embedding=embeddings[node.node_id])
+            for node in selected
         ]
 
 
@@ -421,3 +546,150 @@ async def test_retrieval_does_not_fill_top_k_below_quality_threshold() -> None:
     report = await retriever.retrieve("unrelated question", mode=RetrievalMode.FACT)
 
     assert report.hits == []
+
+
+def test_fused_score_changes_the_pre_rank() -> None:
+    retriever = TreeRagRetriever(embedder=_Embedder(), vector_store=_Store())
+    node = _node("chunk-a", TreeNodeType.CHUNK, text="TreeRAG builds a hierarchical index.")
+
+    weak = _Candidate(
+        node=node,
+        vector_score=0.60,
+        source=RetrievalSource.VECTOR,
+        fused_score=0.01,
+    )
+    strong = _Candidate(
+        node=node,
+        vector_score=0.60,
+        source=RetrievalSource.VECTOR,
+        fused_score=1.0,
+    )
+
+    weak_score = retriever._ranking_score(  # noqa: SLF001
+        weak, fallback_query="How is the index built?"
+    )
+    strong_score = retriever._ranking_score(  # noqa: SLF001
+        strong, fallback_query="How is the index built?"
+    )
+
+    assert strong_score > weak_score
+    assert strong_score - weak_score == pytest.approx(0.5 * 0.20 * 0.99, abs=1e-6)
+
+
+def test_fused_score_is_not_double_counted_within_one_sub_question() -> None:
+    retriever = TreeRagRetriever(embedder=_Embedder(), vector_store=_Store())
+    both = _node("chunk-both", TreeNodeType.CHUNK, text="shared chunk")
+    vector_only = _node("chunk-vector", TreeNodeType.CHUNK, text="vector only")
+    query = RetrievalQuery(query="shared query", mode=RetrievalMode.METHOD)
+
+    candidates = retriever._merge_channels(  # noqa: SLF001
+        [
+            _Recall(
+                query=query,
+                embedding=[1.0, 0.0],
+                routed_paper_ids=("paper",),
+                roots=(),
+                sections=(),
+                vector_matches=(
+                    TreeVectorMatch(node=both, vector_score=0.9),
+                    TreeVectorMatch(node=vector_only, vector_score=0.8),
+                ),
+                keyword_matches=(
+                    TreeKeywordMatch(node=both, keyword_score=0.9, matched_terms=["shared"]),
+                ),
+            )
+        ]
+    )
+
+    assert candidates["chunk-both"].fused_score == pytest.approx(1.0)
+    assert candidates["chunk-both"].source is RetrievalSource.VECTOR
+    assert candidates["chunk-both"].keyword_score == pytest.approx(0.9)
+    expected = (1 / 62) / (2 / 61)
+    assert candidates["chunk-vector"].fused_score == pytest.approx(expected)
+
+
+def test_rrf_weighted_candidates_accumulate_across_sub_questions() -> None:
+    retriever = TreeRagRetriever(embedder=_Embedder(), vector_store=_Store())
+    repeated = _node("chunk-repeated", TreeNodeType.CHUNK, text="found by both questions")
+    single = _node("chunk-single", TreeNodeType.CHUNK, text="found by one question")
+
+    def recall(query: str, matches: tuple[TreeVectorMatch, ...]) -> _Recall:
+        return _Recall(
+            query=RetrievalQuery(query=query, mode=RetrievalMode.COMPARE),
+            embedding=[1.0, 0.0],
+            routed_paper_ids=("paper",),
+            roots=(),
+            sections=(),
+            vector_matches=matches,
+            keyword_matches=(),
+        )
+
+    candidates = retriever._merge_channels(  # noqa: SLF001
+        [
+            recall(
+                "first question",
+                (
+                    TreeVectorMatch(node=repeated, vector_score=0.9),
+                    TreeVectorMatch(node=single, vector_score=0.9),
+                ),
+            ),
+            recall(
+                "second question",
+                (TreeVectorMatch(node=repeated, vector_score=0.9),),
+            ),
+        ]
+    )
+
+    assert candidates["chunk-repeated"].fused_score > candidates["chunk-single"].fused_score
+
+
+def test_named_paper_survives_the_global_candidate_cut() -> None:
+    retriever = TreeRagRetriever(
+        embedder=_Embedder(),
+        vector_store=_Store(),
+        max_candidates=5,
+    )
+    ranked: list[tuple[_Candidate, float]] = [
+        (
+            _Candidate(
+                node=_node(f"paper-a:chunk:{index}", TreeNodeType.CHUNK, paper_id="paper-a"),
+                vector_score=0.9,
+                source=RetrievalSource.VECTOR,
+            ),
+            0.9 - index * 0.01,
+        )
+        for index in range(20)
+    ]
+    ranked.append(
+        (
+            _Candidate(
+                node=_node("paper-b:chunk:1", TreeNodeType.CHUNK, paper_id="paper-b"),
+                vector_score=0.3,
+                source=RetrievalSource.VECTOR,
+            ),
+            0.30,
+        )
+    )
+    budget = retriever._budget_for(  # noqa: SLF001
+        RetrievalStrategy.MULTI_PAPER,
+        ["paper-a", "paper-b"],
+        [RetrievalQuery(query="compare both", mode=RetrievalMode.COMPARE)],
+    )
+
+    reserved, protected = retriever._reserve_candidates(  # noqa: SLF001
+        ranked,
+        target_paper_ids=["paper-a", "paper-b"],
+        coverage_dimensions=[],
+        budget=budget,
+    )
+
+    assert "paper-b:chunk:1" in protected
+
+    node_ids = [item[0].node.node_id for item in reserved]
+    assert node_ids[0] == "paper-a:chunk:0"
+    assert len(reserved) >= 5
+    assert "paper-b:chunk:1" in node_ids
+    assert node_ids[-1] == "paper-b:chunk:1"
+    assert all(
+        reserved[index][1] >= reserved[index + 1][1] for index in range(len(reserved) - 1)
+    )

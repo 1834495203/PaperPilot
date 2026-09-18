@@ -3,6 +3,7 @@ from typing_extensions import TypedDict
 from app.infrastructure.agent.supervisor.models import (
     AgentArtifact,
     CompletedStep,
+    ResearchPlan,
     SupervisorDecision,
 )
 
@@ -10,6 +11,7 @@ from app.infrastructure.agent.supervisor.models import (
 class SupervisorState(TypedDict):
     user_request: str
     conversation_context: str
+    research_plan: ResearchPlan | None
     artifacts: list[AgentArtifact]
     completed_steps: list[CompletedStep]
     decision: SupervisorDecision | None
@@ -22,6 +24,7 @@ class SupervisorState(TypedDict):
 
 
 class SupervisorStateUpdate(TypedDict, total=False):
+    research_plan: ResearchPlan | None
     artifacts: list[AgentArtifact]
     completed_steps: list[CompletedStep]
     decision: SupervisorDecision | None

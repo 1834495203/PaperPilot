@@ -32,6 +32,7 @@ class SupervisorAgentGraph(AgentRunner):
         initial_state = SupervisorState(
             user_request=user_request,
             conversation_context=self._conversation_context(history),
+            research_plan=None,
             artifacts=[],
             completed_steps=[],
             decision=None,

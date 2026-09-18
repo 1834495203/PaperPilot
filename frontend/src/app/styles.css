@@ -221,3 +221,45 @@ button { cursor: pointer; }
   .node-content { font-size: 14px; }
   .paper-stats { grid-template-columns: repeat(2, 1fr); }
 }
+
+.citation-chip.unverified {
+  border: 1px dashed currentColor;
+  cursor: help;
+  font-size: 0.8em;
+  opacity: 0.8;
+  padding: 0 0.4em;
+}
+
+.citation-chip.flagged {
+  border-color: #d9822b;
+  color: #d9822b;
+}
+
+.citation-notice {
+  border-left: 2px solid #d9822b;
+  color: #d9822b;
+  font-size: 0.85em;
+  margin: 0.4rem 0;
+  padding-left: 0.6rem;
+}
+
+.connection-notice {
+  background: rgba(217, 130, 43, 0.12);
+  border-radius: 4px;
+  font-size: 0.85em;
+  margin: 0.4rem 0;
+  padding: 0.4rem 0.6rem;
+}
+
+.version-note {
+  font-size: 0.85em;
+  margin: 0.3rem 0;
+  opacity: 0.85;
+}
+
+.previous-version {
+  border-left: 2px solid currentColor;
+  opacity: 0.8;
+  padding-left: 0.6rem;
+  white-space: pre-wrap;
+}

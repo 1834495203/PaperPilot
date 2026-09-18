@@ -101,6 +101,7 @@ def empty_state(*, artifacts: list[AgentArtifact] | None = None) -> SupervisorSt
     return SupervisorState(
         user_request="Find five directly relevant papers",
         conversation_context="user: Find five directly relevant papers",
+        research_plan=None,
         artifacts=artifacts or [],
         completed_steps=[],
         decision=None,

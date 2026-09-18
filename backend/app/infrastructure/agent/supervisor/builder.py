@@ -6,6 +6,7 @@ from langgraph.graph.state import CompiledStateGraph
 from app.application.agent import AgentRunContext
 from app.infrastructure.agent.supervisor.analyst_agent import AnalystAgentNode
 from app.infrastructure.agent.supervisor.models import AgentName
+from app.infrastructure.agent.supervisor.planner_agent import ResearchPlannerNode
 from app.infrastructure.agent.supervisor.reader_agent import ReaderAgentNode
 from app.infrastructure.agent.supervisor.search_agent import SearchAgentNode
 from app.infrastructure.agent.supervisor.state import SupervisorState
@@ -25,12 +26,14 @@ class SupervisorGraphBuilder:
         reader: ReaderAgentNode,
         analyst: AnalystAgentNode,
         writer: WriterAgentNode,
+        planner: ResearchPlannerNode | None = None,
     ) -> None:
         self._supervisor = supervisor
         self._search = search
         self._reader = reader
         self._analyst = analyst
         self._writer = writer
+        self._planner = planner
 
     def build(
         self,
@@ -46,7 +49,12 @@ class SupervisorGraphBuilder:
         builder.add_node("reader", self._reader)
         builder.add_node("analyst", self._analyst)
         builder.add_node("writer", self._writer)
-        builder.add_edge(START, "supervisor")
+        if self._planner is None:
+            builder.add_edge(START, "supervisor")
+        else:
+            builder.add_node("planner", self._planner)
+            builder.add_edge(START, "planner")
+            builder.add_edge("planner", "supervisor")
         builder.add_conditional_edges(
             "supervisor",
             self._route_supervisor,

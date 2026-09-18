@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.application.chat_service import ChatService
 from app.application.paper_ingestion import PaperIngestionService
 from app.application.paper_library import PaperLibraryService
+from app.application.run_registry import RunRegistry
 from app.application.tree_retrieval import TreeRagRetriever
 from app.config import Settings
 from app.domain.papers import PaperSource
@@ -12,6 +13,7 @@ from app.infrastructure.agent.supervisor.factory import create_supervisor_agent
 from app.infrastructure.db.store import SqlAlchemyConversationStore
 from app.infrastructure.rag.chroma_store import ChromaTreeVectorStore
 from app.infrastructure.rag.embeddings import OpenAITextEmbeddingGateway
+from app.infrastructure.rag.index_signature import build_index_signature
 from app.infrastructure.rag.pdf_parser import PypdfScientificPaperParser
 from app.infrastructure.rag.reranker import SentenceTransformerCrossEncoderReranker
 from app.infrastructure.rag.tree_chunker import TreeRagChunker
@@ -81,9 +83,16 @@ class ApplicationContainer:
             base_url=settings.embedding_base_url,
             dimensions=settings.embedding_dimensions,
         )
+        index_signature = build_index_signature(
+            embedding_model=settings.embedding_model,
+            embedding_dimensions=settings.embedding_dimensions,
+        )
         vector_store = ChromaTreeVectorStore(
             persist_directory=settings.vector_db_path,
             collection_name=settings.vector_collection,
+            keyword_filter_limit=settings.retrieval_keyword_filter_limit,
+            index_signature=index_signature,
+            enforce_index_signature=settings.vector_enforce_index_signature,
         )
         reranker = (
             SentenceTransformerCrossEncoderReranker(
@@ -106,8 +115,18 @@ class ApplicationContainer:
             paper_top_k=settings.retrieval_paper_top_k,
             sections_per_paper=settings.retrieval_sections_per_paper,
             global_fallback_top_k=settings.retrieval_global_fallback_top_k,
+            keyword_top_k=settings.retrieval_keyword_top_k,
+            keyword_enabled=settings.retrieval_keyword_enabled,
+            rerank_candidate_limit=settings.retrieval_rerank_candidate_limit,
+            multi_paper_chunks_per_paper=settings.retrieval_multi_paper_chunks_per_paper,
+            survey_paper_top_k=settings.retrieval_survey_paper_top_k,
+            survey_final_top_k=settings.retrieval_survey_final_top_k,
+            max_final_top_k=settings.retrieval_max_final_top_k,
+            max_expansion_levels=settings.retrieval_max_expansion_levels,
+            rrf_constant=settings.retrieval_rrf_constant,
             min_ranking_score=settings.retrieval_min_ranking_score,
             score_window=settings.retrieval_score_window,
+            rrf_ranking_weight=settings.retrieval_rrf_ranking_weight,
             mmr_top_k=settings.retrieval_mmr_top_k,
             mmr_lambda=settings.retrieval_mmr_lambda,
         )
@@ -128,6 +147,7 @@ class ApplicationContainer:
             retriever=retriever,
             vector_store=vector_store,
             metadata_parser=paper_parser,
+            index_signature=index_signature,
         )
         api_key = settings.llm_api_key
         if not api_key.get_secret_value():
@@ -149,8 +169,15 @@ class ApplicationContainer:
             reader_max_retrieval_rounds=settings.reader_max_retrieval_rounds,
             paper_retriever=retriever,
             paper_library=self.paper_library,
+            enable_research_planner=settings.enable_research_planner,
+            planner_max_answer_dimensions=settings.planner_max_answer_dimensions,
+            enable_citation_verification=settings.enable_citation_verification,
+            citation_verification_max_citations=(
+                settings.citation_verification_max_citations
+            ),
         )
-        self.chat_service = ChatService(self.store, agent)
+        registry = RunRegistry(buffer_size=settings.run_replay_buffer_size)
+        self.chat_service = ChatService(self.store, agent, registry=registry)
 
     async def initialize(self) -> None:
         await self.store.initialize()

@@ -15,6 +15,7 @@ from app.domain.enums import MessageRole, RunStatus
 from app.domain.papers import PaperSearchInput, PaperSearchResult, PdfDocument
 from app.domain.rag import (
     IndexedTreeNode,
+    KeywordSearchResult,
     ParsedPaperDocument,
     TreeIndexNode,
     TreeNodeType,
@@ -37,7 +38,20 @@ class ConversationStore(ABC):
     async def delete_conversation(self, conversation_id: UUID) -> bool: ...
 
     @abstractmethod
-    async def list_messages(self, conversation_id: UUID) -> Sequence[Message]: ...
+    async def list_messages(
+        self,
+        conversation_id: UUID,
+        *,
+        include_superseded: bool = False,
+    ) -> Sequence[Message]:
+        """Thread messages; superseded versions are excluded unless requested."""
+
+    @abstractmethod
+    async def get_message(
+        self,
+        conversation_id: UUID,
+        message_id: UUID,
+    ) -> Message | None: ...
 
     @abstractmethod
     async def list_events(
@@ -60,6 +74,18 @@ class ConversationStore(ABC):
 
     @abstractmethod
     async def list_runs(self, conversation_id: UUID) -> Sequence[AgentRun]: ...
+
+    @abstractmethod
+    async def get_run(self, conversation_id: UUID, run_id: UUID) -> AgentRun | None: ...
+
+    @abstractmethod
+    async def list_run_events(
+        self,
+        run_id: UUID,
+        *,
+        after_sequence: int = 0,
+    ) -> Sequence[AgentEvent]:
+        """Persisted events of one run, for replay after a reconnect."""
 
     @abstractmethod
     async def finish_run(
@@ -100,7 +126,25 @@ class ConversationStore(ABC):
     async def append_event(self, event: AgentEvent) -> None: ...
 
     @abstractmethod
-    async def delete_messages_from(self, conversation_id: UUID, sequence: int) -> None: ...
+    async def supersede_messages_from(
+        self,
+        conversation_id: UUID,
+        sequence: int,
+        *,
+        superseded_by_run: UUID,
+        before_sequence: int | None = None,
+    ) -> int:
+        """Mark the messages of a replaced turn as superseded instead of deleting."""
+
+    @abstractmethod
+    async def supersede_run_messages(
+        self,
+        conversation_id: UUID,
+        run_id: UUID,
+        *,
+        superseded_by_run: UUID,
+    ) -> int:
+        """Hide the messages a failed attempt appended, keeping the previous turn."""
 
     @abstractmethod
     async def delete_run(self, run_id: UUID) -> None: ...
@@ -178,10 +222,34 @@ class TreeVectorStore(ABC):
     ) -> list[TreeVectorMatch]: ...
 
     @abstractmethod
+    async def keyword_search(
+        self,
+        terms: Sequence[str],
+        *,
+        paper_ids: Sequence[str] | None,
+        top_k: int,
+        chunks_only: bool = True,
+        node_types: Sequence[TreeNodeType] | None = None,
+        parent_ids: Sequence[str] | None = None,
+    ) -> KeywordSearchResult:
+        """Lexical recall over stored text, independent of any vector candidate."""
+
+    @abstractmethod
     async def load_paper_nodes(
         self,
         paper_ids: Sequence[str],
     ) -> list[IndexedTreeNode]: ...
+
+    @abstractmethod
+    async def load_nodes(
+        self,
+        *,
+        paper_ids: Sequence[str] | None = None,
+        node_ids: Sequence[str] | None = None,
+        parent_ids: Sequence[str] | None = None,
+        node_types: Sequence[TreeNodeType] | None = None,
+    ) -> list[IndexedTreeNode]:
+        """Load a bounded node set on demand instead of a whole paper tree."""
 
 
 class EventPublisher(ABC):

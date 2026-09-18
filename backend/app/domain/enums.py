@@ -25,11 +25,22 @@ class EventType(StrEnum):
     TOOL_COMPLETED = "tool.completed"
     TOOL_FAILED = "tool.failed"
     METRICS_UPDATED = "metrics.updated"
+    RUN_RESUMED = "run.resumed"
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"
     RUN_CANCELLED = "run.cancelled"
 
 
+TERMINAL_EVENT_TYPES: frozenset[EventType] = frozenset(
+    {
+        EventType.RUN_COMPLETED,
+        EventType.RUN_FAILED,
+        EventType.RUN_CANCELLED,
+    }
+)
+
+# Transport-level only: a resume notice describes the connection, not the run, so
+# it is streamed but never stored.
 PERSISTED_AGENT_EVENT_TYPES: frozenset[EventType] = frozenset(
     {
         EventType.RUN_STARTED,

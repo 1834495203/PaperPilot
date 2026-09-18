@@ -3,7 +3,14 @@ services:
     build: ./backend
     env_file: .env
     environment:
+      # Every durable artifact lives under /data on the mounted volume: the
+      # SQLite database, uploaded PDFs and manifests, and the Chroma index.
+      # Keep these three in sync with the volume below; a relative path here
+      # would put research data inside the container layer and lose it on
+      # `docker compose up --build` or any container recreation.
       DATABASE_URL: sqlite+aiosqlite:////data/paperpilot.db
+      PAPER_LIBRARY_PATH: /data/papers
+      VECTOR_DB_PATH: /data/chroma
       FRONTEND_ORIGIN: http://localhost:3000
     ports:
       - "8000:8000"

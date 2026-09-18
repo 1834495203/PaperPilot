@@ -95,6 +95,8 @@ class _LayoutPage:
 class PypdfScientificPaperParser(ScientificPaperParser):
     """Extract page-aware scientific-paper sections while preserving native headings."""
 
+    VERSION = "pymupdf-layout-2"
+
     _NUMBERED_HEADING = re.compile(
         r"^(?P<index>(?:\d+(?:\.\d+){0,4}|[A-H](?:\.\d+){0,3}))"
         r"[.)]?\s+(?P<title>\S.{1,159})$"
@@ -423,14 +425,14 @@ class PypdfScientificPaperParser(ScientificPaperParser):
         code_blocks: list[CodeBlock] = []
         removed: set[int] = set()
         for box in code_boxes:
-            inside = [
+            indexed_inside = [
                 (index, line)
                 for index, line in enumerate(lines)
                 if self._line_in_box(line, box)
             ]
-            if not inside:
+            if not indexed_inside:
                 continue
-            text = "\n".join(line.text for _, line in inside).strip()
+            text = "\n".join(line.text for _, line in indexed_inside).strip()
             code_blocks.append(
                 CodeBlock(
                     page_number=page_number,
@@ -439,7 +441,7 @@ class PypdfScientificPaperParser(ScientificPaperParser):
                     text=text,
                 )
             )
-            removed.update(index for index, _ in inside)
+            removed.update(index for index, _ in indexed_inside)
         remaining = [line for index, line in enumerate(lines) if index not in removed]
         return code_blocks, remaining
 
@@ -1384,7 +1386,7 @@ class PypdfScientificPaperParser(ScientificPaperParser):
             flush(page_number)
 
         if not builders:
-            blocks = [
+            blocks: list[DocumentBlock] = [
                 PageTextBlock(
                     page_number=page_number,
                     text=normalized,

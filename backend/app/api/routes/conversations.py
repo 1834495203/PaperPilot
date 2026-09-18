@@ -18,12 +18,30 @@ from app.api.schemas import (
 )
 from app.application.chat_service import (
     ChatService,
+    ConversationBusyError,
     ConversationNotFoundError,
     MessageNotFoundError,
 )
 from app.application.paper_library import PaperLibraryService
+from app.domain.entities import AgentEvent
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+def _format_event(event: AgentEvent) -> str:
+    response = EventResponse.from_domain(event)
+    data = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
+    return f"id: {event.sequence}\nevent: {event.type.value}\ndata: {data}\n\n"
+
+
+def _failure_frame(message: str) -> str:
+    return f"event: run.failed\ndata: {json.dumps({'error': message})}\n\n"
 
 
 @router.post("", response_model=ConversationResponse, status_code=status.HTTP_201_CREATED)
@@ -55,15 +73,26 @@ async def delete_conversation(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found",
         ) from error
+    except ConversationBusyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Conversation has an active run",
+        ) from error
 
 
 @router.get("/{conversation_id}/messages", response_model=list[MessageResponse])
 async def list_messages(
     conversation_id: UUID,
     service: Annotated[ChatService, Depends(get_chat_service)],
+    include_superseded: Annotated[bool, Query()] = False,
 ) -> list[MessageResponse]:
+    """Thread messages; regenerated versions stay available behind a flag."""
+
     try:
-        messages = await service.get_messages(conversation_id)
+        messages = await service.get_messages(
+            conversation_id,
+            include_superseded=include_superseded,
+        )
     except ConversationNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -141,6 +170,40 @@ async def cancel_run(
         )
 
 
+@router.get("/{conversation_id}/runs/{run_id}/stream")
+async def resume_run_stream(
+    conversation_id: UUID,
+    run_id: UUID,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+    after: Annotated[int, Query(ge=0)] = 0,
+) -> StreamingResponse:
+    """Re-attach to a run after a dropped connection.
+
+    Replays buffered events after ``after`` and keeps following the run while it is
+    active. A run that is no longer in memory is replayed from persisted events, so
+    the client can restore its trace and then reload the message list.
+    """
+
+    async def event_stream() -> AsyncIterator[str]:
+        try:
+            async for event in service.resume_run(
+                conversation_id,
+                run_id,
+                after_sequence=after,
+            ):
+                yield _format_event(event)
+        except ConversationNotFoundError:
+            yield _failure_frame("Conversation not found")
+        except MessageNotFoundError:
+            yield _failure_frame("Run not found")
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
 @router.post("/{conversation_id}/messages/{message_id}/regenerate")
 async def regenerate_message(
     conversation_id: UUID,
@@ -157,24 +220,18 @@ async def regenerate_message(
                 message_id,
                 local_corpus_available=local_corpus_available,
             ):
-                response = EventResponse.from_domain(event)
-                data = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
-                yield f"id: {event.sequence}\nevent: {event.type.value}\ndata: {data}\n\n"
+                yield _format_event(event)
         except ConversationNotFoundError:
-            error_data = json.dumps({"error": "Conversation not found"})
-            yield f"event: run.failed\ndata: {error_data}\n\n"
+            yield _failure_frame("Conversation not found")
         except MessageNotFoundError:
-            error_data = json.dumps({"error": "Message not found"})
-            yield f"event: run.failed\ndata: {error_data}\n\n"
+            yield _failure_frame("Message not found")
+        except ConversationBusyError as error:
+            yield _failure_frame(str(error))
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=SSE_HEADERS,
     )
 
 
@@ -194,19 +251,14 @@ async def stream_message(
                 request.content,
                 local_corpus_available=local_corpus_available,
             ):
-                response = EventResponse.from_domain(event)
-                data = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
-                yield f"id: {event.sequence}\nevent: {event.type.value}\ndata: {data}\n\n"
+                yield _format_event(event)
         except ConversationNotFoundError:
-            error_data = json.dumps({"error": "Conversation not found"})
-            yield f"event: run.failed\ndata: {error_data}\n\n"
+            yield _failure_frame("Conversation not found")
+        except ConversationBusyError as error:
+            yield _failure_frame(str(error))
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=SSE_HEADERS,
     )

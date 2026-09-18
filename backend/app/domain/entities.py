@@ -28,6 +28,22 @@ class Message:
     created_at: datetime
     metadata: dict[str, JsonValue] = field(default_factory=dict)
 
+    @property
+    def superseded_by_run(self) -> str | None:
+        """Run that replaced this message, or None while it is the live version.
+
+        Regenerating an answer supersedes it instead of deleting it, so a failed
+        retry or a changed mind never destroys research output. Superseded messages
+        stay readable through the API and are hidden from the default thread.
+        """
+
+        value = self.metadata.get("superseded_by_run")
+        return value if isinstance(value, str) else None
+
+    @property
+    def is_active(self) -> bool:
+        return self.superseded_by_run is None
+
 
 @dataclass(frozen=True, slots=True)
 class ToolCallRecord:

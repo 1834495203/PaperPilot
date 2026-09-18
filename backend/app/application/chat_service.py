@@ -5,6 +5,7 @@ from time import perf_counter
 from uuid import UUID
 
 from app.application.agent import AgentRunContext, AgentRunner
+from app.application.run_registry import ActiveRun, RunRegistry, resumed_event_payload
 from app.domain.entities import (
     AgentEvent,
     AgentRun,
@@ -13,7 +14,7 @@ from app.domain.entities import (
     Message,
     RunMetrics,
 )
-from app.domain.enums import EventType, MessageRole, RunStatus
+from app.domain.enums import TERMINAL_EVENT_TYPES, EventType, MessageRole, RunStatus
 from app.domain.ports import ConversationStore
 from app.infrastructure.agent.events import RunEventPublisher
 
@@ -26,11 +27,40 @@ class MessageNotFoundError(LookupError):
     pass
 
 
+class ConversationBusyError(RuntimeError):
+    """Another run is already executing in this conversation."""
+
+    def __init__(self, conversation_id: UUID, run_id: UUID) -> None:
+        super().__init__(
+            f"Conversation {conversation_id} already has an active run {run_id}; "
+            "stop or finish it before starting another one"
+        )
+        self.conversation_id = conversation_id
+        self.run_id = run_id
+
+
 class ChatService:
-    def __init__(self, store: ConversationStore, agent: AgentRunner) -> None:
+    """Owns conversation state and the lifecycle of agent runs.
+
+    A run executes as an independent task inside a :class:`RunRegistry`, so losing
+    the streaming connection only detaches a reader. Reconnecting replays the
+    buffered events after the last sequence the client saw.
+    """
+
+    def __init__(
+        self,
+        store: ConversationStore,
+        agent: AgentRunner,
+        *,
+        registry: RunRegistry | None = None,
+    ) -> None:
         self._store = store
         self._agent = agent
-        self._active_runs: dict[UUID, tuple[UUID, asyncio.Task[None]]] = {}
+        self._registry = registry or RunRegistry()
+
+    @property
+    def registry(self) -> RunRegistry:
+        return self._registry
 
     async def create_conversation(self, title: str) -> Conversation:
         return await self._store.create_conversation(title)
@@ -39,13 +69,24 @@ class ChatService:
         return await self._store.list_conversations()
 
     async def delete_conversation(self, conversation_id: UUID) -> None:
+        active_run_id = self._registry.active_run_id(conversation_id)
+        if active_run_id is not None:
+            raise ConversationBusyError(conversation_id, active_run_id)
         deleted = await self._store.delete_conversation(conversation_id)
         if not deleted:
             raise ConversationNotFoundError(str(conversation_id))
 
-    async def get_messages(self, conversation_id: UUID) -> Sequence[Message]:
+    async def get_messages(
+        self,
+        conversation_id: UUID,
+        *,
+        include_superseded: bool = False,
+    ) -> Sequence[Message]:
         await self._require_conversation(conversation_id)
-        return await self._store.list_messages(conversation_id)
+        return await self._store.list_messages(
+            conversation_id,
+            include_superseded=include_superseded,
+        )
 
     async def get_conversation_metrics(
         self,
@@ -66,17 +107,17 @@ class ChatService:
         await self._require_conversation(conversation_id)
         return await self._store.list_events(conversation_id, limit)
 
+    async def active_run_id(self, conversation_id: UUID) -> UUID | None:
+        return self._registry.active_run_id(conversation_id)
+
     async def cancel_run(self, conversation_id: UUID, run_id: UUID) -> bool:
         await self._require_conversation(conversation_id)
-        active = self._active_runs.get(run_id)
-        if active is None or active[0] != conversation_id:
+        active = self._registry.get(run_id)
+        if active is None or active.conversation_id != conversation_id:
             return False
-        task = active[1]
-        if task.done():
+        if active.task.done():
             return False
-        task.cancel()
-        await task
-        return True
+        return await self._registry.cancel(run_id)
 
     async def stream_message(
         self,
@@ -87,6 +128,7 @@ class ChatService:
         local_corpus_available: bool = False,
     ) -> AsyncIterator[AgentEvent]:
         await self._require_conversation(conversation_id)
+        self._require_idle_conversation(conversation_id)
         selected_paper_ids = tuple(dict.fromkeys(paper_ids))
         run = await self._store.create_run(conversation_id)
         await self._store.append_message(
@@ -98,12 +140,13 @@ class ChatService:
                 "paper_ids": list(selected_paper_ids),
             },
         )
-        async for event in self._stream_run(
-            conversation_id,
-            run,
-            selected_paper_ids,
-            local_corpus_available,
-        ):
+        active = self._start_run(
+            conversation_id=conversation_id,
+            run_id=run.id,
+            paper_ids=selected_paper_ids,
+            local_corpus_available=local_corpus_available,
+        )
+        async for event in self._subscribe(active, after_sequence=0):
             yield event
 
     async def regenerate_message(
@@ -113,84 +156,248 @@ class ChatService:
         *,
         local_corpus_available: bool = False,
     ) -> AsyncIterator[AgentEvent]:
+        """Answer a turn again without destroying the answer being replaced.
+
+        The replaced turn is superseded only after the new answer succeeds, so a
+        failed or cancelled retry leaves the conversation exactly as it was, and the
+        previous version stays readable through ``include_superseded``.
+        """
+
         await self._require_conversation(conversation_id)
-        messages = await self._store.list_messages(conversation_id)
-        target = next((message for message in messages if message.id == message_id), None)
-        if target is None or target.role is not MessageRole.USER:
+        self._require_idle_conversation(conversation_id)
+        target = await self._store.get_message(conversation_id, message_id)
+        if target is None:
             raise MessageNotFoundError(str(message_id))
-        raw_paper_ids = target.metadata.get("paper_ids")
+        question, previous = await self._turn_being_regenerated(conversation_id, target)
+        raw_paper_ids = question.metadata.get("paper_ids")
         selected_paper_ids = (
             tuple(dict.fromkeys(str(item) for item in raw_paper_ids))
             if isinstance(raw_paper_ids, list)
             else ()
         )
-        raw_run_id = target.metadata.get("run_id")
-        if isinstance(raw_run_id, str):
-            try:
-                await self._store.delete_run(UUID(raw_run_id))
-            except ValueError:
-                pass
-        await self._store.delete_messages_from(conversation_id, target.sequence)
+        replaced_run_id = _run_id_of(previous) or _run_id_of(question)
         run = await self._store.create_run(conversation_id)
-        await self._store.append_message(
+        attempt = await self._store.append_message(
             conversation_id,
             MessageRole.USER,
-            target.content,
+            question.content,
             metadata={
                 "run_id": str(run.id),
                 "paper_ids": list(selected_paper_ids),
+                "regenerates_message_id": str(target.id),
             },
         )
-        async for event in self._stream_run(
-            conversation_id,
-            run,
-            selected_paper_ids,
-            local_corpus_available,
-        ):
-            yield event
+        active = self._start_run(
+            conversation_id=conversation_id,
+            run_id=run.id,
+            paper_ids=selected_paper_ids,
+            local_corpus_available=local_corpus_available,
+        )
+        try:
+            async for event in self._subscribe(active, after_sequence=0):
+                yield event
+        finally:
+            await self._settle_regeneration(
+                conversation_id=conversation_id,
+                run_id=run.id,
+                question=question,
+                attempt_sequence=attempt.sequence,
+                replaced_run_id=(
+                    replaced_run_id if replaced_run_id != str(run.id) else None
+                ),
+            )
 
-    async def _stream_run(
+    async def resume_run(
         self,
         conversation_id: UUID,
-        run: AgentRun,
+        run_id: UUID,
+        *,
+        after_sequence: int = 0,
+    ) -> AsyncIterator[AgentEvent]:
+        """Re-attach to a run: buffered replay when live, persisted replay when not."""
+
+        await self._require_conversation(conversation_id)
+        active = self._registry.get(run_id)
+        if active is not None and active.conversation_id == conversation_id:
+            async for event in self._subscribe(active, after_sequence=after_sequence):
+                yield event
+            return
+        run = await self._store.get_run(conversation_id, run_id)
+        if run is None:
+            raise MessageNotFoundError(str(run_id))
+        events = await self._store.list_run_events(run_id, after_sequence=after_sequence)
+        yield AgentEvent.create(
+            run_id=run_id,
+            conversation_id=conversation_id,
+            sequence=after_sequence,
+            event_type=EventType.RUN_RESUMED,
+            payload=resumed_event_payload(
+                run_id=run_id,
+                replayed=len(events),
+                gap=True,
+                active=run.status is RunStatus.RUNNING,
+                latest_sequence=events[-1].sequence if events else after_sequence,
+            ),
+        )
+        for event in events:
+            yield event
+
+    def _start_run(
+        self,
+        *,
+        conversation_id: UUID,
+        run_id: UUID,
         paper_ids: tuple[str, ...],
         local_corpus_available: bool,
-    ) -> AsyncIterator[AgentEvent]:
-        queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
+    ) -> ActiveRun:
         publisher = RunEventPublisher(
-            run_id=run.id,
+            run_id=run_id,
             conversation_id=conversation_id,
             store=self._store,
-            queue=queue,
+            registry=self._registry,
         )
         task = asyncio.create_task(
             self._execute_run(
                 conversation_id=conversation_id,
-                run_id=run.id,
+                run_id=run_id,
                 publisher=publisher,
                 paper_ids=paper_ids,
                 local_corpus_available=local_corpus_available,
             ),
-            name=f"paperpilot-run-{run.id}",
+            name=f"paperpilot-run-{run_id}",
         )
-        self._active_runs[run.id] = (conversation_id, task)
+        return self._registry.register(
+            run_id=run_id,
+            conversation_id=conversation_id,
+            task=task,
+        )
 
+    async def _subscribe(
+        self,
+        active: ActiveRun,
+        *,
+        after_sequence: int,
+    ) -> AsyncIterator[AgentEvent]:
+        """Stream a run from a sequence, then follow it live.
+
+        Closing this generator only detaches the reader: the run keeps executing and
+        its events stay buffered for the next subscriber.
+        """
+
+        replayed, gap = active.snapshot(after_sequence)
+        if after_sequence > 0 or gap:
+            yield AgentEvent.create(
+                run_id=active.run_id,
+                conversation_id=active.conversation_id,
+                sequence=after_sequence,
+                event_type=EventType.RUN_RESUMED,
+                payload=resumed_event_payload(
+                    run_id=active.run_id,
+                    replayed=len(replayed),
+                    gap=gap,
+                    active=not active.is_finished,
+                    latest_sequence=(replayed[-1].sequence if replayed else after_sequence),
+                ),
+            )
+        for event in replayed:
+            yield event
+        if active.is_finished:
+            return
+        subscription = active.attach()
         try:
             while True:
-                event = await queue.get()
-                yield event
-                if event.type in {
-                    EventType.RUN_COMPLETED,
-                    EventType.RUN_FAILED,
-                    EventType.RUN_CANCELLED,
-                }:
-                    break
-            await task
+                live_event = await subscription.queue.get()
+                if live_event is None:
+                    return
+                yield live_event
+                if live_event.type in TERMINAL_EVENT_TYPES:
+                    return
         finally:
-            if not task.done():
-                task.cancel()
-                await task
-            self._active_runs.pop(run.id, None)
+            active.detach(subscription)
+
+    async def _settle_regeneration(
+        self,
+        *,
+        conversation_id: UUID,
+        run_id: UUID,
+        question: Message,
+        attempt_sequence: int,
+        replaced_run_id: str | None,
+    ) -> None:
+        """Decide which version of a regenerated turn stays live.
+
+        The replaced turn keeps its rows and is marked superseded, so the previous
+        answer stays readable. Only a superseded turn's run record - not its
+        messages - is removed, which keeps the trace list free of duplicate turns.
+        """
+
+        active = self._registry.get(run_id)
+        succeeded = (
+            active is not None
+            and active.terminal_event is not None
+            and active.terminal_event.type is EventType.RUN_COMPLETED
+        )
+        if not succeeded:
+            # The attempt lost, so the turn it replaced stays live and the question
+            # this attempt appended is hidden rather than deleted.
+            await self._store.supersede_run_messages(
+                conversation_id,
+                run_id,
+                superseded_by_run=run_id,
+            )
+            return
+        await self._store.supersede_messages_from(
+            conversation_id,
+            question.sequence,
+            superseded_by_run=run_id,
+            before_sequence=attempt_sequence,
+        )
+        if replaced_run_id is not None:
+            try:
+                await self._store.delete_run(UUID(replaced_run_id))
+            except ValueError:
+                return
+
+    async def _turn_being_regenerated(
+        self,
+        conversation_id: UUID,
+        target: Message,
+    ) -> tuple[Message, Message | None]:
+        """Resolve a regenerate target to its question and the answer it replaces."""
+
+        messages = await self._store.list_messages(
+            conversation_id,
+            include_superseded=True,
+        )
+        if target.role is MessageRole.USER:
+            previous = next(
+                (
+                    message
+                    for message in messages
+                    if message.sequence > target.sequence
+                    and message.role is MessageRole.ASSISTANT
+                    and message.is_active
+                ),
+                None,
+            )
+            return target, previous
+        question = next(
+            (
+                message
+                for message in reversed(messages)
+                if message.sequence < target.sequence
+                and message.role is MessageRole.USER
+            ),
+            None,
+        )
+        if question is None:
+            raise MessageNotFoundError(str(target.id))
+        return question, target
+
+    def _require_idle_conversation(self, conversation_id: UUID) -> None:
+        active_run_id = self._registry.active_run_id(conversation_id)
+        if active_run_id is not None:
+            raise ConversationBusyError(conversation_id, active_run_id)
 
     async def _execute_run(
         self,
@@ -246,12 +453,11 @@ class ChatService:
             )
         except asyncio.CancelledError:
             metrics = RunMetrics(duration_ms=int((perf_counter() - started) * 1000))
-            message = "Run cancelled by the user or because the client disconnected"
             await self._store.finish_run(
                 run_id,
                 RunStatus.CANCELLED,
                 metrics,
-                message,
+                "Run cancelled by the user",
             )
             conversation_metrics = await self._store.refresh_conversation_metrics(
                 conversation_id
@@ -300,3 +506,10 @@ class ChatService:
         if conversation is None:
             raise ConversationNotFoundError(str(conversation_id))
         return conversation
+
+
+def _run_id_of(message: Message | None) -> str | None:
+    if message is None:
+        return None
+    value = message.metadata.get("run_id")
+    return value if isinstance(value, str) else None

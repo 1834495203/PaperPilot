@@ -14,6 +14,7 @@ from app.domain.rag import (
     CodeBlock,
     FigureBlock,
     IndexedTreeNode,
+    KeywordSearchResult,
     PageTextBlock,
     PaperBlockType,
     PaperMetadata,
@@ -689,6 +690,28 @@ class _FakeStore(TreeVectorStore):
     async def load_paper_nodes(
         self,
         paper_ids: Sequence[str],
+    ) -> list[IndexedTreeNode]:
+        return []
+
+    async def keyword_search(
+        self,
+        terms: Sequence[str],
+        *,
+        paper_ids: Sequence[str] | None,
+        top_k: int,
+        chunks_only: bool = True,
+        node_types: Sequence[TreeNodeType] | None = None,
+        parent_ids: Sequence[str] | None = None,
+    ) -> KeywordSearchResult:
+        return KeywordSearchResult()
+
+    async def load_nodes(
+        self,
+        *,
+        paper_ids: Sequence[str] | None = None,
+        node_ids: Sequence[str] | None = None,
+        parent_ids: Sequence[str] | None = None,
+        node_types: Sequence[TreeNodeType] | None = None,
     ) -> list[IndexedTreeNode]:
         return []
 

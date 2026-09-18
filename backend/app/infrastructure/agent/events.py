@@ -1,12 +1,15 @@
-import asyncio
 import logging
 from dataclasses import replace
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from app.domain.entities import AgentEvent
 from app.domain.enums import PERSISTED_AGENT_EVENT_TYPES, EventType
 from app.domain.ports import ConversationStore, EventPublisher
 from app.domain.types import JsonValue
+
+if TYPE_CHECKING:
+    from app.application.run_registry import RunRegistry
 
 
 class EventPersistencePolicy:
@@ -41,14 +44,14 @@ class RunEventPublisher(EventPublisher):
         run_id: UUID,
         conversation_id: UUID,
         store: ConversationStore,
-        queue: asyncio.Queue[AgentEvent],
+        registry: "RunRegistry",
         persistence_policy: EventPersistencePolicy | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._run_id = run_id
         self._conversation_id = conversation_id
         self._store = store
-        self._queue = queue
+        self._registry = registry
         self._persistence_policy = persistence_policy or EventPersistencePolicy()
         self._logger = logger or logging.getLogger(__name__)
         self._sequence = 0
@@ -70,7 +73,9 @@ class RunEventPublisher(EventPublisher):
         if stored_event is not None:
             await self._store.append_event(stored_event)
         self._write_log(event)
-        await self._queue.put(event)
+        # Fan out through the registry instead of one queue, so several readers can
+        # follow the same run and a reconnect can replay what it missed.
+        self._registry.publish(self._run_id, event)
 
     def _write_log(self, event: AgentEvent) -> None:
         if event.type is EventType.TOKEN:

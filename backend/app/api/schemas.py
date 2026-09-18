@@ -198,6 +198,8 @@ class MessageResponse(BaseModel):
     sequence: int
     created_at: datetime
     metadata: dict[str, JsonValue]
+    superseded_by_run: str | None = None
+    is_active: bool = True
 
     @classmethod
     def from_domain(cls, message: Message) -> "MessageResponse":
@@ -209,6 +211,8 @@ class MessageResponse(BaseModel):
             sequence=message.sequence,
             created_at=message.created_at,
             metadata=message.metadata,
+            superseded_by_run=message.superseded_by_run,
+            is_active=message.is_active,
         )
 
 
