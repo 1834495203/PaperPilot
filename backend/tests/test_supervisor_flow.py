@@ -7,9 +7,16 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from app.application.agent import AgentRunContext
+from app.application.tree_retrieval import TreeRagRetriever
 from app.domain.enums import EventType
 from app.domain.papers import Paper, PaperSearchAttempt, PaperSearchResult, PaperSource
 from app.domain.ports import EventPublisher, PaperSearchGateway
+from app.domain.rag import (
+    RetrievalHit,
+    RetrievalMode,
+    RetrievalSource,
+    TreeRetrievalReport,
+)
 from app.domain.types import JsonValue
 from app.infrastructure.agent.recording import AgentExecutionRecorder
 from app.infrastructure.agent.search.tools import AcademicPaperSearchAgentTool
@@ -29,6 +36,10 @@ from app.infrastructure.agent.supervisor.models import (
     DecisionSource,
     PaperAssessment,
     PaperRelevance,
+    ReaderDepth,
+    ReaderTask,
+    ReadingEvidenceAssessment,
+    ReadingReport,
     SearchScreening,
     SearchTask,
     SupervisorDecision,
@@ -39,6 +50,21 @@ from app.infrastructure.agent.supervisor.search_agent import SearchAgentNode
 from app.infrastructure.agent.supervisor.state import SupervisorState
 from app.infrastructure.agent.supervisor.supervisor_node import SupervisorNode
 from app.infrastructure.agent.supervisor.writer_agent import WriterAgentNode
+
+
+def _unused_search_node(model: AgentModelGateway) -> SearchAgentNode:
+    gateway = cast(
+        PaperSearchGateway,
+        create_autospec(PaperSearchGateway, instance=True),
+    )
+    return SearchAgentNode(
+        model=model,
+        tool=AcademicPaperSearchAgentTool(gateway),
+        recorder=cast(
+            AgentExecutionRecorder,
+            create_autospec(AgentExecutionRecorder, instance=True),
+        ),
+    )
 
 
 class CapturingPublisher(EventPublisher):
@@ -184,6 +210,7 @@ async def test_supervisor_routes_search_result_back_to_writer() -> None:
         artifacts=[],
         completed_steps=[],
         decision=None,
+        reader_outcome=None,
         step_count=0,
         input_tokens=0,
         output_tokens=0,
@@ -226,6 +253,135 @@ async def test_supervisor_routes_search_result_back_to_writer() -> None:
     assert supervisor_decisions[0]["observations"] == ["The user asks for an external paper"]
 
 
+@pytest.mark.asyncio
+async def test_quick_reader_flow_reaches_writer_without_another_supervisor_call() -> None:
+    model = cast(AgentModelGateway, create_autospec(AgentModelGateway, instance=True))
+    structured = cast(AsyncMock, model.generate_structured)
+    structured.side_effect = [
+        StructuredModelResult(
+            value=SupervisorDecision(
+                assessment=DecisionAssessment(
+                    observations=["The local corpus can answer this narrow question"],
+                    missing_information=["How parsing failures are mitigated"],
+                    decision_summary="Read the local corpus once",
+                ),
+                task=ReaderTask(
+                    objective="How does the system mitigate PDF parsing failures?",
+                    depth=ReaderDepth.QUICK,
+                ),
+            ),
+            usage=ModelUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+        ),
+        StructuredModelResult(
+            value=ReadingEvidenceAssessment(
+                evidence_sufficient=True,
+                coverage_summary="The retrieved chunk answers the question",
+                covered_requirements=["Parsing fallback"],
+                missing_requirements=[],
+                retry_recommended=False,
+            ),
+            usage=ModelUsage(input_tokens=8, output_tokens=4, total_tokens=12),
+        ),
+        StructuredModelResult(
+            value=ReadingReport(
+                paper_or_material="Indexed corpus",
+                analysis_summary="Parsing failures fall back to layout-aware extraction.",
+                objective_satisfied=True,
+                answered_points=["Parsing fallback"],
+                blocking_gaps=[],
+                evidence=[],
+                evidence_scope="One retrieved chunk",
+                limitations=[],
+            ),
+            usage=ModelUsage(input_tokens=6, output_tokens=3, total_tokens=9),
+        ),
+    ]
+    text = cast(AsyncMock, model.generate_text)
+    text.return_value = TextModelResult(
+        text="The system falls back to layout-aware extraction.",
+        usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
+        message=AIMessage(content="The system falls back to layout-aware extraction."),
+    )
+    retriever = cast(TreeRagRetriever, create_autospec(TreeRagRetriever, instance=True))
+    cast(AsyncMock, retriever.retrieve).return_value = TreeRetrievalReport(
+        query="How does the system mitigate PDF parsing failures?",
+        mode=RetrievalMode.METHOD,
+        paper_ids=[],
+        searched_globally=True,
+        candidate_paper_ids=["paperqa"],
+        initial_hit_count=1,
+        expanded_candidate_count=0,
+        hits=[
+            RetrievalHit(
+                rank=1,
+                node_id="paperqa:chunk:1",
+                paper_id="paperqa",
+                section_path=["Methods"],
+                page_start=3,
+                page_end=3,
+                text="Parsing fallback evidence",
+                vector_score=0.9,
+                ranking_score=0.9,
+                source=RetrievalSource.VECTOR,
+            )
+        ],
+    )
+    recorder = cast(
+        AgentExecutionRecorder, create_autospec(AgentExecutionRecorder, instance=True)
+    )
+    cast(AsyncMock, recorder.record_assistant_message).return_value = uuid4()
+    graph = SupervisorGraphBuilder(
+        supervisor=SupervisorNode(model, max_steps=6),
+        search=_unused_search_node(model),
+        reader=ReaderAgentNode(model, paper_retriever=retriever),
+        analyst=AnalystAgentNode(model),
+        writer=WriterAgentNode(model=model, recorder=recorder),
+    ).build()
+    publisher = CapturingPublisher()
+    initial_state = SupervisorState(
+        user_request="How does the system mitigate PDF parsing failures?",
+        conversation_context="user: How does the system mitigate PDF parsing failures?",
+        research_plan=None,
+        artifacts=[],
+        completed_steps=[],
+        decision=None,
+        reader_outcome=None,
+        step_count=0,
+        input_tokens=0,
+        output_tokens=0,
+        total_tokens=0,
+        llm_calls=0,
+        tool_calls=0,
+    )
+
+    result = await graph.ainvoke(
+        initial_state,
+        context=AgentRunContext(
+            conversation_id=uuid4(),
+            run_id=uuid4(),
+            publisher=publisher,
+            local_corpus_available=True,
+        ),
+    )
+
+    assert [step.agent for step in result["completed_steps"]] == [
+        AgentName.READER,
+        AgentName.WRITER,
+    ]
+    # One supervisor decision, two reader calls, one writer call: the quick exit
+    # routes to Writer as policy instead of paying for another supervisor model call.
+    assert structured.await_count == 3
+    assert text.await_count == 1
+    stage_names = [
+        payload["stage"]
+        for event_type, payload in publisher.events
+        if event_type == EventType.STAGE_STARTED.value
+    ]
+    assert stage_names == ["supervisor", "reader", "reader.assess", "writer"]
+    writer_prompt = str(text.await_args.args[0][-1].content)
+    assert "Answer the user's exact question directly and concisely" in writer_prompt
+
+
 def test_supervisor_keeps_model_decision_separate_from_policy_override() -> None:
     state = SupervisorState(
         user_request="Is this idea novel?",
@@ -234,6 +390,7 @@ def test_supervisor_keeps_model_decision_separate_from_policy_override() -> None
         artifacts=[],
         completed_steps=[],
         decision=None,
+        reader_outcome=None,
         step_count=0,
         input_tokens=0,
         output_tokens=0,

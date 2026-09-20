@@ -19,12 +19,14 @@ from app.domain.rag import (
     RetrievalHit,
     RetrievalMode,
     RetrievalSource,
+    RetrievalStrategy,
     TreeRetrievalReport,
 )
 from app.domain.types import JsonValue
 from app.infrastructure.agent.recording import AgentExecutionRecorder
 from app.infrastructure.agent.search.tools import AcademicPaperSearchAgentTool
 from app.infrastructure.agent.supervisor.analyst_agent import AnalystAgentNode
+from app.infrastructure.agent.supervisor.builder import SupervisorGraphBuilder
 from app.infrastructure.agent.supervisor.model_gateway import (
     AgentModelGateway,
     ModelUsage,
@@ -43,10 +45,12 @@ from app.infrastructure.agent.supervisor.models import (
     PaperRelevance,
     ReaderAgentSummary,
     ReaderDepth,
+    ReaderOutcome,
     ReaderTask,
     ReadingEvidenceAssessment,
     ReadingPlan,
     ReadingReport,
+    ReadingSubQuestion,
     SearchAgentSummary,
     SearchReport,
     SearchScreening,
@@ -55,6 +59,10 @@ from app.infrastructure.agent.supervisor.models import (
     SupervisorDecision,
     WriterTask,
 )
+from app.infrastructure.agent.supervisor.reader.graph import ReaderAgentGraph
+from app.infrastructure.agent.supervisor.reader.materials import select_pdf_candidate
+from app.infrastructure.agent.supervisor.reader.reporting import compact_summary
+from app.infrastructure.agent.supervisor.reader.state import ReaderState
 from app.infrastructure.agent.supervisor.reader_agent import ReaderAgentNode
 from app.infrastructure.agent.supervisor.search_agent import SearchAgentNode
 from app.infrastructure.agent.supervisor.state import SupervisorState
@@ -105,6 +113,7 @@ def empty_state(*, artifacts: list[AgentArtifact] | None = None) -> SupervisorSt
         artifacts=artifacts or [],
         completed_steps=[],
         decision=None,
+        reader_outcome=None,
         step_count=0,
         input_tokens=0,
         output_tokens=0,
@@ -247,7 +256,7 @@ def test_reader_task_rejects_fields_from_other_agent_tasks() -> None:
 def test_reader_compacts_long_report_for_supervisor_summary() -> None:
     full_report = "检索文本解析与版面恢复。" * 200
 
-    summary = ReaderAgentNode._compact_summary(full_report)
+    summary = compact_summary(full_report)
 
     assert len(summary) == 1_000
     assert summary.endswith("...")
@@ -544,7 +553,7 @@ def test_reader_selects_requested_pdf_from_search_report() -> None:
         content=report.model_dump_json(),
     )
 
-    selected = ReaderAgentNode._select_pdf_candidate([artifact], paper.paper_id)
+    selected = select_pdf_candidate([artifact], paper.paper_id)
 
     assert selected is not None
     assert selected.paper.arxiv_id == paper.arxiv_id
@@ -841,7 +850,63 @@ async def test_reader_searches_all_local_papers_without_preselecting_one() -> No
     judge_input = str(judge_messages[-1].content)
     assert '"reader_depth": "quick"' in judge_input
     assert len(cast(AsyncMock, model.generate_structured).await_args_list) == 2
+    # Reader reports its outcome and clears the decision; the workflow layer routes.
+    assert update["decision"] is None
+    assert update["reader_outcome"].depth is ReaderDepth.QUICK
+    assert update["reader_outcome"].artifact_id == update["artifacts"][-1].id
+
+
+@pytest.mark.asyncio
+async def test_quick_reader_exit_routes_to_writer_without_a_supervisor_call() -> None:
+    artifact = AgentArtifact(
+        title="Reading report: quick answer",
+        supervisor_summary=ReaderAgentSummary(
+            summary="One focused pass",
+            paper_or_material="Local paper corpus",
+            objective_satisfied=True,
+            answered_points=["PDF parsing mitigation"],
+            blocking_gaps=[],
+            evidence_scope="Globally retrieved local chunks",
+            limitations=[],
+            pdf_truncated=False,
+        ),
+        content="{}",
+    )
+    state = empty_state(artifacts=[artifact])
+    state["reader_outcome"] = ReaderOutcome(
+        depth=ReaderDepth.QUICK,
+        artifact_id=artifact.id,
+        objective_satisfied=True,
+        missing_requirements=["nothing material"],
+    )
+
+    assert SupervisorGraphBuilder._route_after_reader(state) == "reader_exit"
+    update = await SupervisorGraphBuilder._reader_exit(
+        state,
+        Runtime(
+            context=AgentRunContext(
+                conversation_id=uuid4(),
+                run_id=uuid4(),
+                publisher=CapturingPublisher(),
+            )
+        ),
+    )
+
     assert isinstance(update["decision"].task, WriterTask)
+    assert update["decision"].task.source_artifact_ids == [artifact.id]
+    assert update["decision"].assessment.missing_information == ["nothing material"]
+
+
+def test_deep_reader_exit_returns_to_the_supervisor() -> None:
+    state = empty_state()
+    state["reader_outcome"] = ReaderOutcome(
+        depth=ReaderDepth.DEEP,
+        artifact_id=uuid4(),
+        objective_satisfied=False,
+    )
+
+    assert SupervisorGraphBuilder._route_after_reader(state) == "supervisor"
+    assert SupervisorGraphBuilder._route_after_reader(empty_state()) == "supervisor"
 
 
 @pytest.mark.asyncio
@@ -1082,6 +1147,83 @@ async def test_reader_skips_rag_when_metadata_already_answers_the_objective() ->
     cast(AsyncMock, retriever.retrieve).assert_not_awaited()
     assert update["tool_calls"] == 0
     assert update["llm_calls"] == 3
+
+
+def _reader_state(
+    task: ReaderTask,
+    *,
+    plan: ReadingPlan | None = None,
+    retrieval_attempts: int = 0,
+) -> ReaderState:
+    return ReaderState(
+        task=task,
+        research_plan=None,
+        is_local_paper=True,
+        local_metadata=None,
+        pdf_candidate=None,
+        pdf_document=None,
+        material_error=None,
+        plan=plan,
+        assessment=None,
+        coverage_judgments=[],
+        retrieval_reports=[],
+        retrieval_attempts=retrieval_attempts,
+        attempted_queries=[],
+        final_report=None,
+        input_tokens=0,
+        output_tokens=0,
+        total_tokens=0,
+        llm_calls=0,
+        tool_calls=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reader_refuses_a_retrieval_round_once_the_budget_is_spent() -> None:
+    task = ReaderTask(
+        objective="Compare the retrieval method of both papers",
+        depth=ReaderDepth.DEEP,
+        paper_ids=["paper-a", "paper-b"],
+    )
+    plan = ReadingPlan(
+        needs_retrieval=True,
+        query="retrieval method of paper-a",
+        mode=RetrievalMode.METHOD,
+        strategy=RetrievalStrategy.MULTI_PAPER,
+        sub_questions=[
+            ReadingSubQuestion(
+                question="method of paper-a",
+                retrieval_query="retrieval method of paper-a",
+                mode=RetrievalMode.METHOD,
+                paper_ids=["paper-a"],
+                dimension="method",
+            )
+        ],
+        evidence_requirements=["method per paper"],
+        rationale="One sub-question per paper",
+    )
+    retriever = cast(TreeRagRetriever, create_autospec(TreeRagRetriever, instance=True))
+    graph = ReaderAgentGraph(
+        cast(AgentModelGateway, create_autospec(AgentModelGateway, instance=True)),
+        paper_retriever=retriever,
+        max_retrieval_rounds=1,
+    )
+    runtime = Runtime(
+        context=AgentRunContext(
+            conversation_id=uuid4(),
+            run_id=uuid4(),
+            publisher=CapturingPublisher(),
+            paper_ids=("paper-a", "paper-b"),
+        )
+    )
+
+    with pytest.raises(ValueError, match="budget of 1 round"):
+        await graph._retrieve(
+            _reader_state(task, plan=plan, retrieval_attempts=1),
+            runtime,
+        )
+
+    cast(AsyncMock, retriever.retrieve).assert_not_awaited()
 
 
 def test_supervisor_allows_reader_for_a_selected_local_paper() -> None:

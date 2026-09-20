@@ -129,6 +129,7 @@ def _state(artifacts: list[AgentArtifact], source_ids: list[object]) -> Supervis
                 source_artifact_ids=source_ids,  # type: ignore[arg-type]
             ),
         ),
+        reader_outcome=None,
         step_count=0,
         input_tokens=0,
         output_tokens=0,
