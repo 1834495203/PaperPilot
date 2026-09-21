@@ -74,6 +74,7 @@ def _state(task: ReaderTask, *, research_plan: ResearchPlan | None = None) -> Su
             ),
             task=task,
         ),
+        reader_outcome=None,
         step_count=0,
         input_tokens=0,
         output_tokens=0,

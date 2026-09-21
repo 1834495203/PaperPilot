@@ -2,19 +2,26 @@ from typing import Literal
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.runtime import Runtime
 
 from app.application.agent import AgentRunContext
 from app.infrastructure.agent.supervisor.analyst_agent import AnalystAgentNode
-from app.infrastructure.agent.supervisor.models import AgentName
+from app.infrastructure.agent.supervisor.models import (
+    AgentName,
+    DecisionAssessment,
+    ReaderDepth,
+    SupervisorDecision,
+    WriterTask,
+)
 from app.infrastructure.agent.supervisor.planner_agent import ResearchPlannerNode
 from app.infrastructure.agent.supervisor.reader_agent import ReaderAgentNode
 from app.infrastructure.agent.supervisor.search_agent import SearchAgentNode
-from app.infrastructure.agent.supervisor.state import SupervisorState
+from app.infrastructure.agent.supervisor.state import SupervisorState, SupervisorStateUpdate
 from app.infrastructure.agent.supervisor.supervisor_node import SupervisorNode
 from app.infrastructure.agent.supervisor.writer_agent import WriterAgentNode
 
 RouteName = Literal["search", "reader", "analyst", "writer"]
-ReaderExitRoute = Literal["supervisor", "writer"]
+ReaderExitRoute = Literal["supervisor", "reader_exit"]
 
 
 class SupervisorGraphBuilder:
@@ -69,8 +76,10 @@ class SupervisorGraphBuilder:
         builder.add_conditional_edges(
             "reader",
             self._route_after_reader,
-            {"supervisor": "supervisor", "writer": "writer"},
+            {"supervisor": "supervisor", "reader_exit": "reader_exit"},
         )
+        builder.add_node("reader_exit", self._reader_exit)
+        builder.add_edge("reader_exit", "writer")
         builder.add_edge("analyst", "supervisor")
         builder.add_edge("writer", END)
         return builder.compile()
@@ -84,7 +93,43 @@ class SupervisorGraphBuilder:
 
     @staticmethod
     def _route_after_reader(state: SupervisorState) -> ReaderExitRoute:
-        decision = state["decision"]
-        if decision is not None and decision.task.agent is AgentName.WRITER:
-            return "writer"
+        """A finished quick read answers one narrow question and is done."""
+
+        outcome = state["reader_outcome"]
+        if outcome is not None and outcome.depth is ReaderDepth.QUICK:
+            return "reader_exit"
         return "supervisor"
+
+    @staticmethod
+    async def _reader_exit(
+        state: SupervisorState,
+        runtime: Runtime[AgentRunContext],
+    ) -> SupervisorStateUpdate:
+        """Workflow policy: hand a completed quick read straight to Writer.
+
+        This runs instead of Supervisor, so the quick path costs no extra routing
+        model call.
+        """
+
+        del runtime
+        outcome = state["reader_outcome"]
+        if outcome is None:
+            raise ValueError("Reader exit requires a finished reader outcome")
+        return {
+            "decision": SupervisorDecision(
+                assessment=DecisionAssessment(
+                    observations=["Quick Reader completed its single scoped evidence pass"],
+                    missing_information=outcome.missing_requirements,
+                    decision_summary=(
+                        "The quick path is complete; answer the exact question from its evidence"
+                    ),
+                ),
+                task=WriterTask(
+                    objective=(
+                        "Answer the user's exact question directly and concisely using the Reader "
+                        "artifact; state only material evidence limitations"
+                    ),
+                    source_artifact_ids=[outcome.artifact_id],
+                ),
+            )
+        }

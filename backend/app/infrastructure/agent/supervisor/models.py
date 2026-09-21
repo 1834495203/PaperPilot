@@ -416,6 +416,21 @@ class ReaderAgentSummary(BaseModel):
     coverage: CoverageMatrix | None = None
 
 
+class ReaderOutcome(BaseModel):
+    """What a finished reading run hands back to the workflow layer.
+
+    Reader reports what it produced and what stayed unanswered. The workflow layer
+    reads this to choose the next hop, so Reader never names the next agent itself.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    depth: ReaderDepth
+    artifact_id: UUID
+    objective_satisfied: bool
+    missing_requirements: list[str] = Field(default_factory=list, max_length=8)
+
+
 class AnalystAgentSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

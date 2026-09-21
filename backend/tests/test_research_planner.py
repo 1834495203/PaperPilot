@@ -60,6 +60,7 @@ def _state(research_plan: ResearchPlan | None = None) -> SupervisorState:
         artifacts=[],
         completed_steps=[],
         decision=None,
+        reader_outcome=None,
         step_count=0,
         input_tokens=0,
         output_tokens=0,
